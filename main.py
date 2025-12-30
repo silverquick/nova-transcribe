@@ -405,7 +405,13 @@ async def ws_endpoint(websocket: WebSocket):
                             await websocket.send_text(json.dumps({"type": "status", "status": "audio_receiving"}))
                             last_audio_time = current_time
                     except asyncio.QueueFull:
-                        logger.warning("Audio queue full, dropping frame")
+                        # キューが満杯の場合、古いフレームを破棄して新しいフレームを追加（リアルタイム性優先）
+                        try:
+                            audio_q.get_nowait()  # 古いフレームを破棄
+                            audio_q.put_nowait(frame)  # 新しいフレームを追加
+                            logger.warning("Audio queue full, dropped oldest frame to insert new frame")
+                        except Exception as e:
+                            logger.warning(f"Failed to drop old frame: {e}")
 
                 # 切断メッセージ
                 elif message["type"] == "websocket.disconnect":
@@ -432,19 +438,21 @@ async def ws_endpoint(websocket: WebSocket):
             if frame is None:
                 logger.info(f"Audio stream ended. Total frames sent: {frame_count_local}, total bytes: {total_bytes}")
                 return
-            async with session_lock:
-                if session and session.is_active:
-                    try:
-                        await session.send_audio(frame)
-                        frame_count_local += 1
-                        total_bytes += len(frame)
-                        if frame_count_local == 1:
-                            logger.info(f"First audio frame sent to Bedrock: {len(frame)} bytes")
-                        elif frame_count_local % 100 == 0:
-                            logger.info(f"Sent {frame_count_local} audio frames to Bedrock ({total_bytes} bytes)")
-                    except Exception as e:
-                        logger.error(f"Error sending audio to Bedrock: {e}", exc_info=True)
-                        await websocket.send_text(json.dumps({"type": "status", "status": "aws_error", "error": str(e)}))
+            # ロックフリーでセッション参照を取得（レイテンシ削減）
+            # セッション差し替え時のみ session_lock を使用（renew_loop 内）
+            current_session = session
+            if current_session and current_session.is_active:
+                try:
+                    await current_session.send_audio(frame)
+                    frame_count_local += 1
+                    total_bytes += len(frame)
+                    if frame_count_local == 1:
+                        logger.info(f"First audio frame sent to Bedrock: {len(frame)} bytes")
+                    elif frame_count_local % 100 == 0:
+                        logger.info(f"Sent {frame_count_local} audio frames to Bedrock ({total_bytes} bytes)")
+                except Exception as e:
+                    logger.error(f"Error sending audio to Bedrock: {e}", exc_info=True)
+                    await websocket.send_text(json.dumps({"type": "status", "status": "aws_error", "error": str(e)}))
 
     async with session_lock:
         await start_session()
@@ -746,7 +754,13 @@ async def index():
 
       sourceNode = audioCtx.createMediaStreamSource(mediaStream);
       sourceNode.connect(workletNode);
-      // AudioWorkletはdestinationに接続不要（出力なし）
+
+      // 一部のブラウザでは destination 接続がないと process() が呼ばれないため、
+      // GainNode で無音化して destination に接続（process() の確実な実行を保証）
+      const gainNode = audioCtx.createGain();
+      gainNode.gain.value = 0; // 無音化
+      workletNode.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
 
       useAudioWorklet = true;
       console.log('[Audio] Using AudioWorklet (high performance)');
