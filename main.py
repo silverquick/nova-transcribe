@@ -250,12 +250,8 @@ async def ws_endpoint(websocket: WebSocket):
     client = get_bedrock_client(region)
     audio_q: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=256)
 
-    system_prompt = (
-        "You are a helpful assistant that repeats exactly what the user says.\n"
-        "When the user speaks, repeat their words verbatim in text form.\n"
-        "Do not add any commentary, explanations, or responses.\n"
-        "Simply echo back what you heard.\n"
-    )
+    # シンプルなプロンプトで低遅延化
+    system_prompt = "Transcribe the user's speech into text accurately."
 
     session_lock = asyncio.Lock()
     stop_event = asyncio.Event()
@@ -504,6 +500,8 @@ async def index():
     #transcript {
       white-space: pre-wrap;
       min-height: 360px;
+      max-height: 500px;
+      overflow-y: auto;
       background: #fff;
       border: 1px solid #d9dde3;
       padding: 14px;
@@ -555,12 +553,13 @@ async def index():
   let sourceNode = null;
   let processor = null;
   let pingInterval = null;
+  let wakeLock = null;
 
   let finalText = "";
   let partialText = "";
 
   const TARGET_SR = 16000;
-  const FRAME_SAMPLES = 512;
+  const FRAME_SAMPLES = 1600; // 100ms at 16kHz (最適なレスポンス速度とネットワーク効率のバランス)
   let pcmBuffer = new Int16Array(0);
 
   const transcriptDiv = document.getElementById("transcript");
@@ -592,6 +591,8 @@ async def index():
   function updateView() {
     const merged = finalText + (partialText ? partialText : "");
     transcriptDiv.textContent = merged || "…";
+    // 自動スクロール（最新のテキストを表示）
+    transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
   }
 
   function appendFinal(text) {
@@ -658,11 +659,24 @@ async def index():
     const scheme = (location.protocol === "https:") ? "wss" : "ws";
     ws = new WebSocket(`${scheme}://${location.host}/ws`);
 
-    ws.onopen = () => {
+    ws.onopen = async () => {
       setStatus("Connected. Capturing audio…");
       updateIndicator("ws", "active", "Connected");
       updateIndicator("audio", "", "Starting...");
       updateIndicator("aws", "", "Connecting...");
+
+      // 画面スリープ防止（Wake Lock API）
+      try {
+        if ('wakeLock' in navigator) {
+          wakeLock = await navigator.wakeLock.request('screen');
+          console.log('[Wake Lock] Screen wake lock acquired');
+          wakeLock.addEventListener('release', () => {
+            console.log('[Wake Lock] Screen wake lock released');
+          });
+        }
+      } catch (err) {
+        console.warn('[Wake Lock] Failed to acquire wake lock:', err);
+      }
 
       // クライアント側からのキープアライブ (サーバーからのpingに対してpongを返す)
       pingInterval = setInterval(() => {
@@ -765,6 +779,17 @@ async def index():
     if (processor) { try { processor.disconnect(); } catch {} }
     if (sourceNode) { try { sourceNode.disconnect(); } catch {} }
     if (audioContext) { try { audioContext.close(); } catch {} }
+
+    // Wake Lock解放
+    if (wakeLock) {
+      try {
+        wakeLock.release();
+        console.log('[Wake Lock] Released wake lock');
+      } catch (err) {
+        console.warn('[Wake Lock] Failed to release wake lock:', err);
+      }
+      wakeLock = null;
+    }
 
     processor = null;
     sourceNode = null;
