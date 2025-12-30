@@ -248,7 +248,8 @@ async def ws_endpoint(websocket: WebSocket):
     region = os.getenv("AWS_REGION", AWS_REGION_DEFAULT)
 
     client = get_bedrock_client(region)
-    audio_q: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=256)
+    # キューを浅くしてリアルタイム性を確保（20フレーム = 2秒分、古いフレームは破棄）
+    audio_q: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=20)
 
     # シンプルなプロンプトで低遅延化
     system_prompt = "Transcribe the user's speech into text accurately."
@@ -551,16 +552,27 @@ async def index():
   let ws = null;
   let audioContext = null;
   let sourceNode = null;
-  let processor = null;
+  let workletNode = null;
+  let legacyProcessor = null;
   let pingInterval = null;
   let wakeLock = null;
+  let useAudioWorklet = false;
 
   let finalText = "";
   let partialText = "";
 
   const TARGET_SR = 16000;
-  const FRAME_SAMPLES = 1600; // 100ms at 16kHz (最適なレスポンス速度とネットワーク効率のバランス)
-  let pcmBuffer = new Int16Array(0);
+  const FRAME_SAMPLES = 1600; // 100ms at 16kHz
+
+  // リングバッファ：固定サイズで再割り当てを防止
+  const RING_BUFFER_SIZE = 8000; // 500ms分のバッファ
+  const ringBuffer = new Int16Array(RING_BUFFER_SIZE);
+  let ringWriteIndex = 0;
+  let ringReadIndex = 0;
+
+  // フレーム送信用の固定バッファ（再割り当て防止）
+  const frameBuffer = new ArrayBuffer(FRAME_SAMPLES * 2);
+  const frameView = new DataView(frameBuffer);
 
   const transcriptDiv = document.getElementById("transcript");
   const statusDiv = document.getElementById("status");
@@ -591,7 +603,6 @@ async def index():
   function updateView() {
     const merged = finalText + (partialText ? partialText : "");
     transcriptDiv.textContent = merged || "…";
-    // 自動スクロール（最新のテキストを表示）
     transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
   }
 
@@ -607,55 +618,174 @@ async def index():
     updateView();
   }
 
-  function toInt16LE(float32Array) {
-    const out = new Int16Array(float32Array.length);
-    for (let i = 0; i < float32Array.length; i++) {
-      let s = Math.max(-1, Math.min(1, float32Array[i]));
-      out[i] = (s < 0 ? s * 0x8000 : s * 0x7FFF);
+  // リングバッファに書き込み
+  function ringBufferWrite(samples) {
+    for (let i = 0; i < samples.length; i++) {
+      ringBuffer[ringWriteIndex] = samples[i];
+      ringWriteIndex = (ringWriteIndex + 1) % RING_BUFFER_SIZE;
+      // オーバーフロー時は古いデータを上書き（リアルタイム性優先）
+      if (ringWriteIndex === ringReadIndex) {
+        ringReadIndex = (ringReadIndex + 1) % RING_BUFFER_SIZE;
+      }
     }
-    return out;
   }
 
-  function downsampleBuffer(input, inputSampleRate, outputSampleRate) {
-    if (outputSampleRate === inputSampleRate) return input;
-    if (outputSampleRate > inputSampleRate) throw new Error("Output sample rate must be <= input sample rate");
+  // リングバッファから読み出し可能なサンプル数
+  function ringBufferAvailable() {
+    if (ringWriteIndex >= ringReadIndex) {
+      return ringWriteIndex - ringReadIndex;
+    }
+    return RING_BUFFER_SIZE - ringReadIndex + ringWriteIndex;
+  }
+
+  // リングバッファからフレームを送信（コピーなしでDataViewに直接書き込み）
+  function flushFrames() {
+    while (ringBufferAvailable() >= FRAME_SAMPLES) {
+      for (let i = 0; i < FRAME_SAMPLES; i++) {
+        frameView.setInt16(i * 2, ringBuffer[ringReadIndex], true);
+        ringReadIndex = (ringReadIndex + 1) % RING_BUFFER_SIZE;
+      }
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(frameBuffer);
+      }
+    }
+  }
+
+  // Float32 -> Int16LE 変換（最適化版：事前確保配列使用）
+  function toInt16LEOptimized(float32Array, outputArray) {
+    const len = float32Array.length;
+    for (let i = 0; i < len; i++) {
+      let s = float32Array[i];
+      s = s < -1 ? -1 : (s > 1 ? 1 : s);
+      outputArray[i] = s < 0 ? (s * 0x8000) | 0 : (s * 0x7FFF) | 0;
+    }
+    return len;
+  }
+
+  // ダウンサンプリング（最適化版）
+  function downsampleOptimized(input, inputSampleRate, outputSampleRate, outputArray) {
+    if (outputSampleRate === inputSampleRate) {
+      for (let i = 0; i < input.length; i++) outputArray[i] = input[i];
+      return input.length;
+    }
     const ratio = inputSampleRate / outputSampleRate;
     const newLen = Math.round(input.length / ratio);
-    const result = new Float32Array(newLen);
     let offset = 0;
     for (let i = 0; i < newLen; i++) {
       const nextOffset = Math.round((i + 1) * ratio);
       let acc = 0, count = 0;
       for (let j = offset; j < nextOffset && j < input.length; j++) { acc += input[j]; count++; }
-      result[i] = count ? (acc / count) : 0;
+      outputArray[i] = count ? (acc / count) : 0;
       offset = nextOffset;
     }
-    return result;
+    return newLen;
   }
 
-  function concatInt16(a, b) {
-    const out = new Int16Array(a.length + b.length);
-    out.set(a, 0);
-    out.set(b, a.length);
-    return out;
-  }
+  // AudioWorkletプロセッサのコード
+  const workletCode = `
+    class PCMProcessor extends AudioWorkletProcessor {
+      constructor() {
+        super();
+        this.buffer = new Float32Array(4096);
+        this.bufferIndex = 0;
+        this.targetSampleRate = 16000;
+        this.chunkSize = 1024; // 送信チャンクサイズ
+      }
 
-  function int16ToArrayBufferLE(int16Arr) {
-    const buf = new ArrayBuffer(int16Arr.length * 2);
-    const view = new DataView(buf);
-    for (let i = 0; i < int16Arr.length; i++) view.setInt16(i * 2, int16Arr[i], true);
-    return buf;
-  }
+      process(inputs, outputs, parameters) {
+        const input = inputs[0];
+        if (!input || input.length === 0) return true;
 
-  function flushFrames() {
-    while (pcmBuffer.length >= FRAME_SAMPLES) {
-      const frame = pcmBuffer.subarray(0, FRAME_SAMPLES);
-      pcmBuffer = pcmBuffer.subarray(FRAME_SAMPLES);
-      if (ws && ws.readyState === WebSocket.OPEN) ws.send(int16ToArrayBufferLE(frame));
+        const channelData = input[0];
+        if (!channelData) return true;
+
+        // バッファに追加
+        for (let i = 0; i < channelData.length; i++) {
+          this.buffer[this.bufferIndex++] = channelData[i];
+
+          // バッファがいっぱいになったらメインスレッドに送信
+          if (this.bufferIndex >= this.chunkSize) {
+            this.port.postMessage({
+              audioData: this.buffer.slice(0, this.bufferIndex),
+              sampleRate: sampleRate
+            });
+            this.bufferIndex = 0;
+          }
+        }
+        return true;
+      }
     }
+    registerProcessor('pcm-processor', PCMProcessor);
+  `;
+
+  // AudioWorkletの初期化
+  async function initAudioWorklet(audioCtx, mediaStream) {
+    try {
+      const blob = new Blob([workletCode], { type: 'application/javascript' });
+      const url = URL.createObjectURL(blob);
+      await audioCtx.audioWorklet.addModule(url);
+      URL.revokeObjectURL(url);
+
+      workletNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
+
+      // ワーカー用の一時バッファ（再割り当て防止）
+      const tempFloat = new Float32Array(4096);
+      const tempInt16 = new Int16Array(4096);
+
+      workletNode.port.onmessage = (e) => {
+        const { audioData, sampleRate } = e.data;
+        // ダウンサンプリング
+        const downLen = downsampleOptimized(audioData, sampleRate, TARGET_SR, tempFloat);
+        // Int16変換
+        toInt16LEOptimized(tempFloat.subarray(0, downLen), tempInt16);
+        // リングバッファに書き込み
+        ringBufferWrite(tempInt16.subarray(0, downLen));
+        // フレーム送信
+        flushFrames();
+      };
+
+      sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+      sourceNode.connect(workletNode);
+      // AudioWorkletはdestinationに接続不要（出力なし）
+
+      useAudioWorklet = true;
+      console.log('[Audio] Using AudioWorklet (high performance)');
+      return true;
+    } catch (err) {
+      console.warn('[AudioWorklet] Not available, falling back to ScriptProcessor:', err);
+      return false;
+    }
+  }
+
+  // レガシーScriptProcessorNode（フォールバック）
+  function initLegacyProcessor(audioCtx, mediaStream) {
+    sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+    legacyProcessor = audioCtx.createScriptProcessor(2048, 1, 1);
+
+    // フォールバック用の一時バッファ
+    const tempFloat = new Float32Array(4096);
+    const tempInt16 = new Int16Array(4096);
+
+    legacyProcessor.onaudioprocess = (e) => {
+      const input = e.inputBuffer.getChannelData(0);
+      const downLen = downsampleOptimized(input, audioCtx.sampleRate, TARGET_SR, tempFloat);
+      toInt16LEOptimized(tempFloat.subarray(0, downLen), tempInt16);
+      ringBufferWrite(tempInt16.subarray(0, downLen));
+      flushFrames();
+    };
+
+    sourceNode.connect(legacyProcessor);
+    legacyProcessor.connect(audioCtx.destination);
+
+    useAudioWorklet = false;
+    console.log('[Audio] Using ScriptProcessorNode (legacy fallback)');
   }
 
   async function start() {
+    // リングバッファをリセット
+    ringWriteIndex = 0;
+    ringReadIndex = 0;
+
     const scheme = (location.protocol === "https:") ? "wss" : "ws";
     ws = new WebSocket(`${scheme}://${location.host}/ws`);
 
@@ -665,7 +795,7 @@ async def index():
       updateIndicator("audio", "", "Starting...");
       updateIndicator("aws", "", "Connecting...");
 
-      // 画面スリープ防止（Wake Lock API）
+      // Wake Lock
       try {
         if ('wakeLock' in navigator) {
           wakeLock = await navigator.wakeLock.request('screen');
@@ -675,10 +805,10 @@ async def index():
           });
         }
       } catch (err) {
-        console.warn('[Wake Lock] Failed to acquire wake lock:', err);
+        console.warn('[Wake Lock] Failed:', err);
       }
 
-      // クライアント側からのキープアライブ (サーバーからのpingに対してpongを返す)
+      // キープアライブ
       pingInterval = setInterval(() => {
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({type: "pong"}));
@@ -701,23 +831,15 @@ async def index():
     };
 
     ws.onmessage = (event) => {
-      console.log("[WS] Received:", event.data);
       try {
         const msg = JSON.parse(event.data);
-        console.log("[WS] Parsed:", msg);
-
         if (msg.type === "final") {
-          console.log("[WS] Final text:", msg.text);
           appendFinal(msg.text);
         } else if (msg.type === "speculative" || msg.type === "partial") {
-          console.log("[WS] Partial text:", msg.text);
           setPartial(msg.text);
         } else if (msg.type === "info") {
-          console.log("[WS] Info:", msg.text);
           setStatus(msg.text);
         } else if (msg.type === "status") {
-          console.log("[WS] Status update:", msg.status);
-          // サーバーからのステータス更新
           if (msg.status === "aws_connected") {
             updateIndicator("aws", "active", "Connected");
           } else if (msg.status === "aws_error") {
@@ -729,15 +851,11 @@ async def index():
             updateIndicator("aws", "active", "Transcribing");
           }
         } else if (msg.type === "ping") {
-          console.log("[WS] Ping received, sending pong");
-          // サーバーからのpingには自動応答
           ws.send(JSON.stringify({type: "pong"}));
         } else {
-          console.log("[WS] Unknown type:", msg.type);
           setPartial(msg.text || "");
         }
       } catch (e) {
-        console.error("[WS] Parse error:", e, event.data);
         appendFinal(event.data);
       }
     };
@@ -747,19 +865,12 @@ async def index():
     });
 
     audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    sourceNode = audioContext.createMediaStreamSource(mediaStream);
-    processor = audioContext.createScriptProcessor(2048, 1, 1);
 
-    processor.onaudioprocess = (e) => {
-      const input = e.inputBuffer.getChannelData(0);
-      const down = downsampleBuffer(input, audioContext.sampleRate, TARGET_SR);
-      const int16 = toInt16LE(down);
-      pcmBuffer = concatInt16(pcmBuffer, int16);
-      flushFrames();
-    };
-
-    sourceNode.connect(processor);
-    processor.connect(audioContext.destination);
+    // AudioWorkletを試行、失敗時はScriptProcessorにフォールバック
+    const workletSuccess = await initAudioWorklet(audioContext, mediaStream);
+    if (!workletSuccess) {
+      initLegacyProcessor(audioContext, mediaStream);
+    }
 
     updateIndicator("audio", "active", "Capturing");
 
@@ -773,10 +884,10 @@ async def index():
     setStatus("Stopping…");
     if (ws) { try { ws.close(); } catch {} }
     ws = null;
-    pcmBuffer = new Int16Array(0);
 
     if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-    if (processor) { try { processor.disconnect(); } catch {} }
+    if (workletNode) { try { workletNode.disconnect(); } catch {} }
+    if (legacyProcessor) { try { legacyProcessor.disconnect(); } catch {} }
     if (sourceNode) { try { sourceNode.disconnect(); } catch {} }
     if (audioContext) { try { audioContext.close(); } catch {} }
 
@@ -784,16 +895,21 @@ async def index():
     if (wakeLock) {
       try {
         wakeLock.release();
-        console.log('[Wake Lock] Released wake lock');
+        console.log('[Wake Lock] Released');
       } catch (err) {
-        console.warn('[Wake Lock] Failed to release wake lock:', err);
+        console.warn('[Wake Lock] Failed to release:', err);
       }
       wakeLock = null;
     }
 
-    processor = null;
+    workletNode = null;
+    legacyProcessor = null;
     sourceNode = null;
     audioContext = null;
+
+    // リングバッファをリセット
+    ringWriteIndex = 0;
+    ringReadIndex = 0;
 
     updateIndicator("ws", "", "Disconnected");
     updateIndicator("audio", "", "Idle");

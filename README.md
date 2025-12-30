@@ -145,6 +145,36 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000 --proxy-headers --env-file .e
   - **AWS**: Bedrock との通信状態
 - サーバー側ログでも詳細な状態を確認可能
 
+### 高パフォーマンス実行（本番環境向け）
+
+低遅延・高スループットが必要な場合、以下のオプションを追加して実行：
+
+```bash
+uv run uvicorn main:app --host 0.0.0.0 --port 8000 --loop uvloop --http httptools --ws websockets --env-file .env
+```
+
+**オプション説明:**
+
+- `--loop uvloop`: 高速な非同期イベントループ（Cython製、標準asyncioより2-4倍高速）
+- `--http httptools`: 高速なHTTPパーサー（Cython製）
+- `--ws websockets`: 高速なWebSocketライブラリ
+
+**複数クライアント対応（マルチワーカー）:**
+
+```bash
+uv run uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4 --loop uvloop --http httptools --ws websockets --env-file .env
+```
+
+**注意**: `--reload` と `--workers` は併用できません。開発時は `--reload`、本番環境では `--workers` を使用してください。
+
+**追加パッケージのインストール:**
+
+上記オプションを使用するには、追加パッケージが必要です：
+
+```bash
+uv add uvloop httptools websockets
+```
+
 ## 使い方
 
 1. ブラウザで `http://localhost:8000` にアクセス
