@@ -1,11 +1,13 @@
-# Amazon Nova 2 Sonic リアルタイム英語文字起こし Webアプリ
+# Amazon Nova 2 Sonic リアルタイム英語文字起こし / 英日翻訳 Webアプリ
 
-Amazon Bedrock の Nova 2 Sonic を使った、ブラウザマイク音声からのリアルタイム英語文字起こしアプリケーションです。
+Amazon Bedrock の Nova 2 Sonic を使ったブラウザマイク音声からのリアルタイム英語文字起こしに加え、Claude 4.5 Haiku による英日翻訳（ストリーミング）も同時表示するアプリケーションです。
 
 ## 概要
 
 - ブラウザのマイクから音声を取得
 - Bedrock の Nova 2 Sonic 双方向ストリーミングで英語文字起こし
+- Bedrock の Claude 4.5 Haiku で英日翻訳（**final のみ** / ストリーミング）
+- 英語（USER final）と日本語を **1発話ごとに紐づけて表示**（Aligned EN ↔ JA）
 - リアルタイム表示とTXTファイル保存機能
 - 8分のストリーム寿命制限を自動更新で回避
 - **画面スリープ防止機能**（モバイル対応 - Wake Lock API）
@@ -17,8 +19,8 @@ Amazon Bedrock の Nova 2 Sonic を使った、ブラウザマイク音声から
 - **Python 3.12+** （aws_sdk_bedrock_runtime が Python>=3.12 を要求）
 - **uv** パッケージマネージャー
 - AWS アカウントと以下の設定：
-  - Amazon Bedrock で **Nova 2 Sonic** の Model access が有効
-  - 適切な IAM 権限（`bedrock:InvokeModel`）
+  - Amazon Bedrock で **Nova 2 Sonic** / **Claude 4.5 Haiku** の Model access が有効
+  - 適切な IAM 権限（`bedrock:InvokeModelWithBidirectionalStream` / `bedrock:InvokeModelWithResponseStream` など）
   - 利用リージョン: `ap-northeast-1`（Tokyo）推奨
 
 ## AWS 側の設定
@@ -26,7 +28,11 @@ Amazon Bedrock の Nova 2 Sonic を使った、ブラウザマイク音声から
 ### 1. Bedrock: Model access の有効化
 
 1. AWS コンソール → Amazon Bedrock
-2. **Model access** で **Nova 2 Sonic** を "Access granted" にする
+2. **Model access** で以下を "Access granted" にする
+   - **Amazon Nova 2 Sonic**
+   - **Anthropic Claude 4.5 Haiku**
+3. Anthropic 系モデルは、初回利用前に **use case details**（利用目的の申請）提出が必要な場合があります  
+   エラーに `Model use case details have not been submitted` と出たら、フォームを提出して **15分ほど待ってから**再試行してください
 
 ### 2. IAM: ユーザーと権限
 
@@ -38,12 +44,22 @@ Amazon Bedrock の Nova 2 Sonic を使った、ブラウザマイク音声から
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": "bedrock:InvokeModel",
-      "Resource": "arn:aws:bedrock:ap-northeast-1::foundation-model/amazon.nova-2-sonic-v1:0"
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithBidirectionalStream",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:*::foundation-model/amazon.nova-2-sonic-v1:0",
+        "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0"
+      ]
     }
   ]
 }
 ```
+
+**補足**:
+- 翻訳で inference profile（ID/ARN）を使う場合、IAM の `Resource` に inference profile の ARN も許可してください（または運用方針に応じて `Resource: "*"`）。
 
 ### 3. アクセスキーの作成
 
@@ -80,6 +96,21 @@ cd /path/to/your/workspace
 AWS_ACCESS_KEY_ID=AKIAxxxxxxxxxxxxxxxx
 AWS_SECRET_ACCESS_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 AWS_REGION=ap-northeast-1
+
+# 翻訳設定（オプション）
+# 注意: Claude 4.5 Haiku はリージョンによって on-demand throughput が使えず、
+# inference profile の ID/ARN 指定が必要な場合があります
+# 推奨（inference profile 例）:
+TRANSLATION_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0
+# on-demand が使える場合の例:
+# TRANSLATION_MODEL_ID=anthropic.claude-haiku-4-5-20251001-v1:0
+# on-demand が使えない場合のフォールバック（必要なら変更）:
+# TRANSLATION_MODEL_ID_FALLBACK=us.anthropic.claude-haiku-4-5-20251001-v1:0
+# TRANSLATION_MAX_TOKENS=400
+# 翻訳のスロットリング対策（必要なら調整）:
+# TRANSLATION_DEBOUNCE_SECONDS=0.4
+# TRANSLATION_MIN_INTERVAL_SECONDS=0.6
+# TRANSLATION_MAX_BATCH_CHARS=1200
 
 # デバッグログを有効にする場合（オプション）
 # LOG_LEVEL=DEBUG
@@ -180,10 +211,12 @@ uv add uvloop httptools websockets
 1. ブラウザで `http://localhost:8000` にアクセス
 2. **Start** ボタンをクリック
 3. マイク権限を許可
-4. 英語で話すと、リアルタイムで文字起こしが表示されます
-5. **Download TXT** で文字起こしをテキストファイルとして保存
-6. **Clear** で表示内容をクリア
-7. **Stop** で録音を停止
+4. 英語で話すと、リアルタイムで英語文字起こしが表示されます（partial/final）
+5. **final（確定）** テキスト（USERロール）のみ、日本語翻訳が下部にストリーミング表示されます
+6. **Aligned EN ↔ JA** で、英語（発話）と日本語（翻訳）が行単位で対応表示されます（スマホ幅では自動的に縦積み）
+6. **Download TXT** で英語文字起こし + 日本語翻訳をテキストファイルとして保存
+7. **Clear** で文字起こし/翻訳の両方をクリア
+8. **Stop** で録音を停止
 
 ### セッション自動更新
 
@@ -223,6 +256,35 @@ Bedrock のストリーム寿命（8分）を回避するため、7分45秒ご�
 - **設定**: シンプルで直接的な指示文
 - **効果**: モデルの初期処理時間を短縮（Time to First Token の改善）
 
+### ブラウザ側音声処理（高パフォーマンス）
+
+**AudioWorklet 実装:**
+
+- **最新ブラウザ**: AudioWorklet で音声処理をUIスレッドから分離（高パフォーマンス）
+- **古いブラウザ**: ScriptProcessorNode に自動フォールバック（互換性確保）
+- **効果**: UIブロック解消、GC削減、CPU負荷軽減
+
+**リングバッファ最適化:**
+
+- **固定サイズバッファ**: 8000サンプル（500ms分）で再割り当てを防止
+- **フレーム送信用固定バッファ**: ArrayBuffer事前確保でGC削減
+- **コピー削減**: DataViewへの直接書き込みで連結操作を最小限に
+- **効果**: メモリ効率向上、CPU負荷軽減
+
+**変換処理の最適化:**
+
+- **Float32→Int16変換**: 事前確保配列を使用してGC削減
+- **ダウンサンプリング**: インプレース処理で不要なメモリ割り当てを回避
+- **効果**: CPU負荷軽減、メモリ効率向上
+
+### サーバー側最適化
+
+**キューの深さ削減:**
+
+- **設定値**: 20フレーム（2秒分）
+- **効果**: リアルタイム性を優先し、遅延の蓄積を防止
+- **動作**: キューが満杯時は古いフレームを破棄（リアルタイム性優先）
+
 ### その他の最適化
 
 - **発話終了検知**: `endpointingSensitivity: HIGH` で高速化
@@ -234,9 +296,14 @@ Bedrock のストリーム寿命（8分）を回避するため、7分45秒ご�
 
 ### AccessDenied / Unauthorized エラー
 
-- IAM ユーザーに `bedrock:InvokeModel` 権限があるか確認
+- IAM ユーザーに `bedrock:InvokeModelWithBidirectionalStream` / `bedrock:InvokeModelWithResponseStream` 権限があるか確認
 - Bedrock の Model access が許可されているか確認
 - `.env` のキーが正しいか確認（空白や全角文字の混入に注意）
+
+### 書き起こし中に `{ "interrupted": true }` が出てくる
+
+- これは音声の本文ではなく、モデルが返すことがある **システム的なタグ**です
+- 本アプリではこの形式の出力は表示/翻訳対象から除外しています
 
 ### リージョン不一致エラー
 

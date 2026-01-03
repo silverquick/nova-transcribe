@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Optional
@@ -17,14 +18,21 @@ from aws_sdk_bedrock_runtime.client import (
 from aws_sdk_bedrock_runtime.models import (
     InvokeModelWithBidirectionalStreamInputChunk,
     BidirectionalInputPayloadPart,
+    InvokeModelWithResponseStreamInput,
+    ResourceNotFoundException,
+    ThrottlingException,
+    ValidationException,
 )
-from aws_sdk_bedrock_runtime.config import Config, HTTPAuthSchemeResolver, SigV4AuthScheme
+from aws_sdk_bedrock_runtime.config import Config, SigV4AuthScheme
 from smithy_aws_core.identity import EnvironmentCredentialsResolver
+from smithy_core.interceptors import Interceptor
+from smithy_core.interfaces import TypedProperties
+from smithy_http import Field
 
 # ログ設定
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=getattr(logging, log_level),
+    level=getattr(logging, log_level, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
@@ -47,6 +55,16 @@ for name in logging.root.manager.loggerDict:
 app = FastAPI()
 
 MODEL_ID = "amazon.nova-2-sonic-v1:0"
+TRANSLATION_MODEL_ID_DEFAULT = "anthropic.claude-haiku-4-5-20251001-v1:0"
+TRANSLATION_MODEL_ID = os.getenv("TRANSLATION_MODEL_ID", TRANSLATION_MODEL_ID_DEFAULT)
+TRANSLATION_MODEL_ID_FALLBACK_DEFAULT = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+TRANSLATION_MODEL_ID_FALLBACK = os.getenv(
+    "TRANSLATION_MODEL_ID_FALLBACK", TRANSLATION_MODEL_ID_FALLBACK_DEFAULT
+)
+TRANSLATION_MAX_TOKENS = int(os.getenv("TRANSLATION_MAX_TOKENS", "400"))
+TRANSLATION_DEBOUNCE_SECONDS = float(os.getenv("TRANSLATION_DEBOUNCE_SECONDS", "0.4"))
+TRANSLATION_MIN_INTERVAL_SECONDS = float(os.getenv("TRANSLATION_MIN_INTERVAL_SECONDS", "0.6"))
+TRANSLATION_MAX_BATCH_CHARS = int(os.getenv("TRANSLATION_MAX_BATCH_CHARS", "1200"))
 AWS_REGION_DEFAULT = "ap-northeast-1"
 
 # Bedrock側ストリーム寿命(8分)手前で更新
@@ -55,14 +73,44 @@ RENEW_SECONDS = 7 * 60 + 45  # 7m45s
 KEEPALIVE_SECONDS = 30
 
 
+class SigV4AuthSchemeWithChecksum(SigV4AuthScheme):
+    def signer_properties(self, *, context: TypedProperties) -> dict:
+        props = super().signer_properties(context=context)
+        props["content_checksum_enabled"] = True
+        return props
+
+
+class FixDuplicateContentTypeInterceptor(Interceptor):
+    def modify_before_signing(self, context):
+        req = context.transport_request
+        try:
+            content_type = req.fields["content-type"]
+        except Exception:
+            return req
+
+        if not getattr(content_type, "values", None) or len(content_type.values) <= 1:
+            return req
+
+        preferred = None
+        for val in content_type.values:
+            if val.lower().startswith("application/json"):
+                preferred = val
+                break
+        if preferred is None:
+            preferred = content_type.values[0]
+
+        req.fields.set_field(Field(name=content_type.name, values=[preferred]))
+        return req
+
+
 def get_bedrock_client(region: str) -> BedrockRuntimeClient:
     cfg = Config(
         endpoint_uri=f"https://bedrock-runtime.{region}.amazonaws.com",
         region=region,
         aws_credentials_identity_resolver=EnvironmentCredentialsResolver(),
-        auth_scheme_resolver=HTTPAuthSchemeResolver(),
-        auth_schemes={"aws.auth#sigv4": SigV4AuthScheme(service="bedrock")},
     )
+    cfg.set_auth_scheme(SigV4AuthSchemeWithChecksum(service="bedrock"))
+    cfg.interceptors.append(FixDuplicateContentTypeInterceptor())
     return BedrockRuntimeClient(config=cfg)
 
 
@@ -239,6 +287,127 @@ def _extract_generation_stage(content_start_event: dict) -> Optional[str]:
         return None
 
 
+_INTERRUPTED_TAG_RE = re.compile(r"^\s*\{\s*[\"']interrupted[\"']\s*:\s*true\s*\}\s*$", re.I)
+
+
+def _is_interrupted_tag(text: str) -> bool:
+    if not text:
+        return False
+    if _INTERRUPTED_TAG_RE.match(text):
+        return True
+    stripped = text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return False
+    try:
+        obj = json.loads(stripped)
+    except Exception:
+        return False
+    return isinstance(obj, dict) and obj.get("interrupted") is True and len(obj) == 1
+
+
+def _extract_response_stream_bytes(event: object) -> Optional[bytes]:
+    if event is None:
+        return None
+
+    if isinstance(event, dict):
+        for key in ("output", "chunk", "value"):
+            part = event.get(key)
+            if isinstance(part, (bytes, bytearray)):
+                return bytes(part)
+            if isinstance(part, dict):
+                for bytes_key in ("bytes", "bytes_"):
+                    b = part.get(bytes_key)
+                    if isinstance(b, (bytes, bytearray)):
+                        return bytes(b)
+            else:
+                b = getattr(part, "bytes_", None)
+                if isinstance(b, (bytes, bytearray)):
+                    return bytes(b)
+        return None
+
+    for attr in ("output", "chunk", "value"):
+        part = getattr(event, attr, None)
+        if part is None:
+            continue
+        b = getattr(part, "bytes_", None)
+        if isinstance(b, (bytes, bytearray)):
+            return bytes(b)
+
+    b = getattr(event, "bytes_", None)
+    if isinstance(b, (bytes, bytearray)):
+        return bytes(b)
+    return None
+
+
+async def stream_prompt_text_deltas(
+    client: BedrockRuntimeClient,
+    *,
+    prompt: str,
+    model_id: str,
+) -> object:
+    """
+    Claude 4.5 Haiku をストリーミング呼び出しし、テキスト delta を yield する。
+    """
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": TRANSLATION_MAX_TOKENS,
+        "temperature": 0.0,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": prompt}],
+            }
+        ],
+    }
+
+    req = InvokeModelWithResponseStreamInput(
+        model_id=model_id,
+        content_type="application/json",
+        accept="application/json",
+        body=json.dumps(body).encode("utf-8"),
+    )
+
+    async with (await client.invoke_model_with_response_stream(req)) as stream:
+        async for event in stream.output_stream:
+            payload = _extract_response_stream_bytes(event)
+            if not payload:
+                continue
+            try:
+                chunk = json.loads(payload.decode("utf-8"))
+            except Exception:
+                continue
+
+            if chunk.get("type") != "content_block_delta":
+                continue
+            delta = chunk.get("delta") or {}
+            delta_text = delta.get("text")
+            if not delta_text:
+                continue
+            yield delta_text
+
+
+_INDEXED_LINE_RE = re.compile(r"^\s*(\d{1,6})\s*[\t:]\s*(.*?)\s*$")
+
+
+def _parse_indexed_output_line(line: str) -> Optional[tuple[int, str]]:
+    """
+    例: "1\tこんにちは" / "1: こんにちは"
+    """
+    if not line:
+        return None
+    line = line.strip("\r")
+    if not line.strip():
+        return None
+    m = _INDEXED_LINE_RE.match(line)
+    if not m:
+        return None
+    idx = int(m.group(1))
+    ja = m.group(2).strip()
+    if not ja:
+        return None
+    return idx, ja
+
+
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -250,6 +419,7 @@ async def ws_endpoint(websocket: WebSocket):
     client = get_bedrock_client(region)
     # キューを浅くしてリアルタイム性を確保（20フレーム = 2秒分、古いフレームは破棄）
     audio_q: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=20)
+    translation_q: asyncio.Queue[dict] = asyncio.Queue(maxsize=50)
 
     # シンプルなプロンプトで低遅延化
     system_prompt = "Transcribe the user's speech into text accurately."
@@ -264,6 +434,255 @@ async def ws_endpoint(websocket: WebSocket):
     audio_frame_count = 0
     last_audio_time = time.time()
     transcription_count = 0
+    translation_count = 0
+    translation_started = False
+    translation_enabled = True
+    translation_disabled_reason: Optional[str] = None
+    translation_segment_seq = 0
+    translation_model_id_in_use = TRANSLATION_MODEL_ID
+    translation_model_id_fallback = TRANSLATION_MODEL_ID_FALLBACK
+
+    logger.info(
+        "Translation model configured: "
+        f"primary='{translation_model_id_in_use}', fallback='{translation_model_id_fallback}'"
+    )
+
+    async def translation_worker():
+        nonlocal translation_count, translation_model_id_in_use, translation_enabled, translation_disabled_reason
+        logger.info("translation_worker task started, waiting for translation requests...")
+        last_request_at = 0.0
+        backoff_seconds = 0.0
+        while not stop_event.is_set():
+            try:
+                first_item = await translation_q.get()
+            except asyncio.CancelledError:
+                break
+
+            if stop_event.is_set():
+                break
+            if not translation_enabled:
+                continue
+
+            # Debounce: 少し待って複数の final セグメントをまとめて翻訳（リクエスト数削減）
+            batch_items = [first_item]
+            batch_chars = len((first_item.get("en") or "").strip())
+            start = time.monotonic()
+            while batch_chars < TRANSLATION_MAX_BATCH_CHARS:
+                remaining = TRANSLATION_DEBOUNCE_SECONDS - (time.monotonic() - start)
+                if remaining <= 0:
+                    break
+                try:
+                    nxt = await asyncio.wait_for(translation_q.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+                except asyncio.CancelledError:
+                    return
+                if not nxt:
+                    continue
+                batch_items.append(nxt)
+                batch_chars += len((nxt.get("en") or "").strip())
+
+            pending_items = []
+            for it in batch_items:
+                seg_id = it.get("id")
+                en = (it.get("en") or "").replace("\n", " ").strip()
+                if not seg_id or not en:
+                    continue
+                pending_items.append({"id": seg_id, "en": en})
+            if not pending_items:
+                continue
+
+            translation_count += 1
+            logger.info(
+                f"Translation request #{translation_count}: "
+                f"segments={len(pending_items)}, text_len={sum(len(x['en']) for x in pending_items)}"
+            )
+
+            while pending_items and not stop_event.is_set():
+                # リクエスト間隔を空ける（Throttling 対策）
+                now = time.monotonic()
+                wait_for = (last_request_at + TRANSLATION_MIN_INTERVAL_SECONDS) - now
+                if wait_for > 0:
+                    await asyncio.sleep(wait_for)
+
+                last_request_at = time.monotonic()
+
+                try:
+                    # バッチ入力を "N<TAB>English" で渡し、出力も同形式を要求する（英日対応づけ用）
+                    input_lines = []
+                    for i, it in enumerate(pending_items, start=1):
+                        input_lines.append(f"{i}\t{it['en']}")
+
+                    prompt = (
+                        "Translate each line from English to natural Japanese.\n"
+                        "Each input line is formatted as: N<TAB>English.\n"
+                        "Output exactly one line per input line, formatted as: N<TAB>Japanese.\n"
+                        "Keep N the same. Do not add any extra lines, headings, or code blocks.\n\n"
+                        + "\n".join(input_lines)
+                    )
+
+                    buffer = ""
+                    async for delta in stream_prompt_text_deltas(
+                        client, prompt=prompt, model_id=translation_model_id_in_use
+                    ):
+                        buffer += delta
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            parsed = _parse_indexed_output_line(line)
+                            if not parsed:
+                                continue
+                            idx, ja = parsed
+                            if 1 <= idx <= len(pending_items):
+                                seg_id = pending_items[idx - 1]["id"]
+                                await websocket.send_text(
+                                    json.dumps({"type": "aligned_ja", "id": seg_id, "ja": ja})
+                                )
+
+                    # 最後に改行が来ないケース
+                    parsed_last = _parse_indexed_output_line(buffer)
+                    if parsed_last:
+                        idx, ja = parsed_last
+                        if 1 <= idx <= len(pending_items):
+                            seg_id = pending_items[idx - 1]["id"]
+                            await websocket.send_text(
+                                json.dumps({"type": "aligned_ja", "id": seg_id, "ja": ja})
+                            )
+
+                    backoff_seconds = 0.0
+                    break
+
+                except ResourceNotFoundException as e:
+                    message_raw = getattr(e, "message", None) or str(e) or ""
+                    message = message_raw.lower()
+                    if "use case details" in message and "anthropic" in message:
+                        translation_enabled = False
+                        translation_disabled_reason = message_raw
+                        logger.error(
+                            "Translation disabled (Anthropic use case details not submitted). "
+                            f"details='{message_raw}'"
+                        )
+                        try:
+                            await websocket.send_text(
+                                json.dumps(
+                                    {
+                                        "type": "translation_error",
+                                        "error": (
+                                            "Anthropic の利用目的（use case details）が未提出のため翻訳を実行できません。"
+                                            "AWS コンソール → Bedrock → Model access で Anthropic の use case details を提出し、"
+                                            "15分ほど待ってから再試行してください。"
+                                        ),
+                                    }
+                                )
+                            )
+                        except Exception:
+                            break
+
+                        # 以降の翻訳リクエストを破棄（ログ/エラーのスパム防止）
+                        try:
+                            while True:
+                                translation_q.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                        pending_items = []
+                        break
+
+                    logger.error(f"Translation error: {e}", exc_info=True)
+                    try:
+                        await websocket.send_text(
+                            json.dumps({"type": "translation_error", "error": str(e)})
+                        )
+                    except Exception:
+                        break
+                    break
+
+                except ValidationException as e:
+                    message = (getattr(e, "message", None) or str(e) or "").lower()
+                    if (
+                        "on-demand throughput" in message
+                        and "inference profile" in message
+                        and translation_model_id_in_use != translation_model_id_fallback
+                    ):
+                        logger.warning(
+                            "Translation model does not support on-demand throughput. "
+                            f"Switching to inference profile: {translation_model_id_fallback}"
+                        )
+                        translation_model_id_in_use = translation_model_id_fallback
+                        try:
+                            await websocket.send_text(
+                                json.dumps(
+                                    {
+                                        "type": "info",
+                                        "text": (
+                                            "翻訳モデルを inference profile に切り替えました: "
+                                            f"model_id={translation_model_id_in_use}"
+                                        ),
+                                    }
+                                )
+                            )
+                        except Exception:
+                            pass
+                        continue
+
+                    logger.error(f"Translation error: {e}", exc_info=True)
+                    try:
+                        await websocket.send_text(
+                            json.dumps({"type": "translation_error", "error": str(e)})
+                        )
+                    except Exception:
+                        break
+                    break
+
+                except ThrottlingException as e:
+                    # 翻訳が追いつかないときは待って再試行し、キューが溜まっていればまとめて翻訳する
+                    backoff_seconds = min(backoff_seconds * 2 if backoff_seconds else 0.5, 8.0)
+                    logger.warning(
+                        f"Translation throttled. Backing off {backoff_seconds:.1f}s: {e}"
+                    )
+                    try:
+                        await websocket.send_text(
+                            json.dumps(
+                                {
+                                    "type": "info",
+                                    "text": f"翻訳が混雑しています。{backoff_seconds:.1f}秒待って再試行します…",
+                                }
+                            )
+                        )
+                    except Exception:
+                        pass
+
+                    # 待機中に溜まった分をまとめる（ただしサイズ上限まで）
+                    try:
+                        while sum(len(x["en"]) for x in pending_items) < TRANSLATION_MAX_BATCH_CHARS:
+                            nxt = translation_q.get_nowait()
+                            if not nxt:
+                                continue
+                            seg_id = nxt.get("id")
+                            en = (nxt.get("en") or "").replace("\n", " ").strip()
+                            if not seg_id or not en:
+                                continue
+                            if sum(len(x["en"]) for x in pending_items) + len(en) > TRANSLATION_MAX_BATCH_CHARS:
+                                break
+                            pending_items.append({"id": seg_id, "en": en})
+                    except asyncio.QueueEmpty:
+                        pass
+
+                    await asyncio.sleep(backoff_seconds)
+                    continue
+
+                except Exception as e:
+                    logger.error(f"Translation error: {e}", exc_info=True)
+                    try:
+                        await websocket.send_text(
+                            json.dumps({"type": "translation_error", "error": str(e)})
+                        )
+                    except Exception:
+                        break
+                    break
+
+        logger.info(
+            "translation_worker task ended. "
+            f"Total translations: {translation_count}, stop_event: {stop_event.is_set()}"
+        )
 
     async def start_session():
         nonlocal session, output_task
@@ -288,7 +707,7 @@ async def ws_endpoint(websocket: WebSocket):
         output_task = asyncio.create_task(read_outputs())
 
     async def read_outputs():
-        nonlocal session, transcription_count
+        nonlocal session, transcription_count, translation_segment_seq
         logger.info("read_outputs task started, waiting for Bedrock events...")
         event_count = 0
         while not stop_event.is_set() and session and session.is_active:
@@ -325,6 +744,11 @@ async def ws_endpoint(websocket: WebSocket):
                         logger.warning("Empty text in textOutput")
                         continue
 
+                    # Nova 側が返す可能性があるシステムタグ（例: {"interrupted": true}）は表示/翻訳対象外
+                    if _is_interrupted_tag(text):
+                        logger.info(f"Skipping system tag textOutput: {text.strip()}")
+                        continue
+
                     # USERロールとASSISTANTロールの両方を表示（Nova 2 Sonicは会話型AIのため）
                     if session.current_role in ["USER", "ASSISTANT"]:
                         stage_lower = (session.current_generation_stage or "FINAL").lower()
@@ -332,6 +756,37 @@ async def ws_endpoint(websocket: WebSocket):
                         logger.info(f"Transcription #{transcription_count} ({stage_lower}, {role}): {text[:50]}...")
                         await websocket.send_text(json.dumps({"type": stage_lower, "text": text}))
                         await websocket.send_text(json.dumps({"type": "status", "status": "transcribing"}))
+
+                        # final（確定）テキストのみ翻訳（レイテンシ/コスト最適化）
+                        # NOTE: 翻訳は「音声入力＝USERロール」のみ（ASSISTANTは翻訳しない）
+                        if stage_lower == "final" and role == "USER":
+                            if not translation_enabled:
+                                continue
+                            try:
+                                translation_segment_seq += 1
+                                seg_id = f"u{translation_segment_seq}"
+                                await websocket.send_text(
+                                    json.dumps({"type": "aligned_en", "id": seg_id, "en": text})
+                                )
+                                translation_q.put_nowait({"id": seg_id, "en": text})
+                            except asyncio.QueueFull:
+                                # キューが満杯の場合、古いリクエストを破棄して新しい翻訳を優先（リアルタイム性優先）
+                                try:
+                                    translation_q.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    pass
+                                try:
+                                    translation_segment_seq += 1
+                                    seg_id = f"u{translation_segment_seq}"
+                                    await websocket.send_text(
+                                        json.dumps({"type": "aligned_en", "id": seg_id, "en": text})
+                                    )
+                                    translation_q.put_nowait({"id": seg_id, "en": text})
+                                    logger.warning(
+                                        "Translation queue full, dropped oldest translation request to insert new one"
+                                    )
+                                except asyncio.QueueFull:
+                                    logger.warning("Translation queue full, dropped translation request")
                     else:
                         logger.debug(f"Skipping non-USER/ASSISTANT text (role={role})")
                     continue
@@ -355,7 +810,11 @@ async def ws_endpoint(websocket: WebSocket):
 
     async def renew_loop():
         while not stop_event.is_set():
-            await asyncio.sleep(RENEW_SECONDS)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=RENEW_SECONDS)
+                return
+            except asyncio.TimeoutError:
+                pass
             if stop_event.is_set():
                 return
             logger.info("Renewing Bedrock session (8-minute limit prevention)...")
@@ -368,7 +827,11 @@ async def ws_endpoint(websocket: WebSocket):
     async def keepalive_loop():
         """プロキシタイムアウト回避用のキープアライブ"""
         while not stop_event.is_set():
-            await asyncio.sleep(KEEPALIVE_SECONDS)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=KEEPALIVE_SECONDS)
+                return
+            except asyncio.TimeoutError:
+                pass
             if stop_event.is_set():
                 return
             try:
@@ -379,7 +842,7 @@ async def ws_endpoint(websocket: WebSocket):
                 break
 
     async def recv_from_browser():
-        nonlocal audio_frame_count, last_audio_time
+        nonlocal audio_frame_count, last_audio_time, translation_started
         try:
             while not stop_event.is_set():
                 message = await websocket.receive()
@@ -390,6 +853,15 @@ async def ws_endpoint(websocket: WebSocket):
                         msg = json.loads(message["text"])
                         if msg.get("type") == "pong":
                             logger.debug("Received pong from browser")
+                        elif msg.get("type") == "clear":
+                            # ブラウザ側で表示がクリアされたので、区切り用の先頭改行を抑制し、
+                            # 追いかけている翻訳キューも捨てて表示と整合させる
+                            translation_started = False
+                            try:
+                                while True:
+                                    translation_q.get_nowait()
+                            except asyncio.QueueEmpty:
+                                pass
                     except json.JSONDecodeError:
                         logger.warning(f"Invalid JSON received: {message['text'][:100]}")
 
@@ -462,6 +934,7 @@ async def ws_endpoint(websocket: WebSocket):
         asyncio.create_task(keepalive_loop()),
         asyncio.create_task(recv_from_browser()),
         asyncio.create_task(send_to_bedrock()),
+        asyncio.create_task(translation_worker()),
     ]
 
     try:
@@ -518,6 +991,53 @@ async def index():
       font-size: 16px;
       line-height: 1.5;
     }
+    #translation {
+      white-space: pre-wrap;
+      min-height: 360px;
+      max-height: 500px;
+      overflow-y: auto;
+      background: #f9fafb;
+      border: 1px solid #d9dde3;
+      padding: 14px;
+      border-radius: 10px;
+      font-size: 16px;
+      line-height: 1.5;
+      margin-top: 12px;
+    }
+    #pairs {
+      min-height: 360px;
+      max-height: 500px;
+      overflow-y: auto;
+      background: #fff;
+      border: 1px solid #d9dde3;
+      border-radius: 10px;
+      margin-top: 12px;
+    }
+    .pair {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      padding: 12px 14px;
+      border-bottom: 1px solid #eef2f7;
+    }
+    .pair:hover { background: #f1f5ff; }
+    .pair:last-child { border-bottom: 0; }
+    .pair-col { white-space: pre-wrap; }
+    .pair-col::before { display: none; }
+    .pair-en { color: #1f2937; }
+    .pair-ja { color: #0f766e; }
+    @media (max-width: 720px) {
+      .pair { grid-template-columns: 1fr; gap: 10px; }
+      .pair-col::before {
+        display: block;
+        content: attr(data-label);
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        color: #6b7280;
+        margin-bottom: 6px;
+      }
+    }
     .hint { margin-top: 10px; font-size: 12px; color: #666; }
     code { background: #eef1f5; padding: 1px 4px; border-radius: 4px; }
   </style>
@@ -550,6 +1070,10 @@ async def index():
   </div>
 
   <div id="transcript">Press "Start" and speak.</div>
+  <h3>Japanese Translation</h3>
+  <div id="translation">…</div>
+  <h3>Aligned EN ↔ JA (USER final)</h3>
+  <div id="pairs">…</div>
   <div class="hint">
     If you deploy behind HTTPS, this page will automatically use <code>wss://</code>. Microphone access requires a secure context (HTTPS or localhost).
     <br>Status indicators show connection health in real-time.
@@ -568,6 +1092,9 @@ async def index():
 
   let finalText = "";
   let partialText = "";
+	  let finalTranslation = "";
+	  let partialTranslation = "";
+      const alignedPairs = new Map(); // id -> { en, ja, row, enEl, jaEl }
 
   const TARGET_SR = 16000;
   const FRAME_SAMPLES = 1600; // 100ms at 16kHz
@@ -582,12 +1109,14 @@ async def index():
   const frameBuffer = new ArrayBuffer(FRAME_SAMPLES * 2);
   const frameView = new DataView(frameBuffer);
 
-  const transcriptDiv = document.getElementById("transcript");
-  const statusDiv = document.getElementById("status");
-  const startBtn = document.getElementById("start");
-  const stopBtn = document.getElementById("stop");
-  const downloadBtn = document.getElementById("download");
-  const clearBtn = document.getElementById("clear");
+	  const transcriptDiv = document.getElementById("transcript");
+	  const translationDiv = document.getElementById("translation");
+      const pairsDiv = document.getElementById("pairs");
+	  const statusDiv = document.getElementById("status");
+	  const startBtn = document.getElementById("start");
+	  const stopBtn = document.getElementById("stop");
+	  const downloadBtn = document.getElementById("download");
+	  const clearBtn = document.getElementById("clear");
 
   const wsIndicator = document.getElementById("ws-indicator");
   const wsStatus = document.getElementById("ws-status");
@@ -614,16 +1143,74 @@ async def index():
     transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
   }
 
-  function appendFinal(text) {
-    if (finalText && !finalText.endsWith("\\n")) finalText += " ";
-    finalText += text.trim();
-    partialText = "";
+	  function updateTranslationView() {
+	    translationDiv.textContent = finalTranslation || "…";
+	    translationDiv.scrollTop = translationDiv.scrollHeight;
+	  }
+
+      function rebuildTranslationFromPairs() {
+        const lines = [];
+        for (const item of alignedPairs.values()) {
+          if (item.ja) lines.push(item.ja);
+        }
+        finalTranslation = lines.join("\\n");
+        partialTranslation = "";
+        updateTranslationView();
+      }
+
+      function addAlignedPair(id, en) {
+        if (!id) return;
+        if (alignedPairs.has(id)) return;
+        if (pairsDiv.textContent === "…") pairsDiv.textContent = "";
+
+        const row = document.createElement("div");
+        row.className = "pair";
+        row.dataset.id = id;
+
+        const enEl = document.createElement("div");
+        enEl.className = "pair-col pair-en";
+        enEl.dataset.label = "EN";
+        enEl.textContent = en || "";
+
+        const jaEl = document.createElement("div");
+        jaEl.className = "pair-col pair-ja";
+        jaEl.dataset.label = "JA";
+        jaEl.textContent = "…";
+
+        row.appendChild(enEl);
+        row.appendChild(jaEl);
+        pairsDiv.appendChild(row);
+
+        alignedPairs.set(id, { en: en || "", ja: "", row, enEl, jaEl });
+        pairsDiv.scrollTop = pairsDiv.scrollHeight;
+      }
+
+      function setAlignedJa(id, ja) {
+        if (!id) return;
+        if (!alignedPairs.has(id)) addAlignedPair(id, "");
+        const item = alignedPairs.get(id);
+        item.ja = ja || "";
+        item.jaEl.textContent = item.ja || "…";
+        pairsDiv.scrollTop = pairsDiv.scrollHeight;
+        rebuildTranslationFromPairs();
+      }
+
+	  function appendFinal(text) {
+	    if (finalText && !finalText.endsWith("\\n")) finalText += " ";
+	    finalText += text.trim();
+	    partialText = "";
     updateView();
   }
 
   function setPartial(text) {
     partialText = text ? (text.trim() + " ") : "";
     updateView();
+  }
+
+  function appendTranslation(text) {
+    finalTranslation += text;
+    partialTranslation = "";
+    updateTranslationView();
   }
 
   // リングバッファに書き込み
@@ -844,16 +1431,24 @@ async def index():
       if (pingInterval) clearInterval(pingInterval);
     };
 
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === "final") {
-          appendFinal(msg.text);
-        } else if (msg.type === "speculative" || msg.type === "partial") {
-          setPartial(msg.text);
-        } else if (msg.type === "info") {
-          setStatus(msg.text);
-        } else if (msg.type === "status") {
+	    ws.onmessage = (event) => {
+	      try {
+	        const msg = JSON.parse(event.data);
+	        if (msg.type === "final") {
+	          appendFinal(msg.text);
+	        } else if (msg.type === "speculative" || msg.type === "partial") {
+	          setPartial(msg.text);
+	        } else if (msg.type === "translation") {
+	          appendTranslation(msg.text);
+            } else if (msg.type === "aligned_en") {
+              addAlignedPair(msg.id, msg.en);
+            } else if (msg.type === "aligned_ja") {
+              setAlignedJa(msg.id, msg.ja);
+	        } else if (msg.type === "translation_error") {
+	          setStatus("Translation Error: " + (msg.error || "Unknown"));
+	        } else if (msg.type === "info") {
+	          setStatus(msg.text);
+	        } else if (msg.type === "status") {
           if (msg.status === "aws_connected") {
             updateIndicator("aws", "active", "Connected");
           } else if (msg.status === "aws_error") {
@@ -934,7 +1529,16 @@ async def index():
   }
 
   function download() {
-    const content = (finalText + partialText).trim();
+    const transcriptContent = (finalText + partialText).trim();
+    const translationContent = (finalTranslation + partialTranslation).trim();
+    const content = [
+      "=== English Transcript ===",
+      transcriptContent || "…",
+      "",
+      "=== Japanese Translation ===",
+      translationContent || "…",
+      "",
+    ].join("\\n");
     const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -944,11 +1548,19 @@ async def index():
     URL.revokeObjectURL(url);
   }
 
-  function clearAll() {
-    finalText = "";
-    partialText = "";
-    updateView();
-  }
+	  function clearAll() {
+	    finalText = "";
+	    partialText = "";
+	    updateView();
+	    finalTranslation = "";
+	    partialTranslation = "";
+	    updateTranslationView();
+        alignedPairs.clear();
+        if (pairsDiv) pairsDiv.textContent = "…";
+	    if (ws && ws.readyState === WebSocket.OPEN) {
+	      try { ws.send(JSON.stringify({type: "clear"})); } catch {}
+	    }
+	  }
 
   startBtn.onclick = () => start().catch(err => setStatus(String(err)));
   stopBtn.onclick = () => stop();
