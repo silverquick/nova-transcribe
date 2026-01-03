@@ -1,13 +1,14 @@
 # Amazon Nova 2 Sonic リアルタイム英語文字起こし / 英日翻訳 Webアプリ
 
-Amazon Bedrock の Nova 2 Sonic を使ったブラウザマイク音声からのリアルタイム英語文字起こしに加え、Claude 4.5 Haiku による英日翻訳（ストリーミング）も同時表示するアプリケーションです。
+Amazon Bedrock の Nova 2 Sonic を使ったブラウザ音声（Mic / Tab Audio）からのリアルタイム英語文字起こしに加え、Claude 4.5 Haiku による英日翻訳（ストリーミング）も同時表示するアプリケーションです。
 
 ## 概要
 
-- ブラウザのマイクから音声を取得
+- ブラウザの入力ソース（Mic / Tab Audio）から音声を取得（Tab Audio は Chrome/Edge 前提）
 - Bedrock の Nova 2 Sonic 双方向ストリーミングで英語文字起こし
 - Bedrock の Claude 4.5 Haiku で英日翻訳（**final のみ** / ストリーミング）
 - 英語（USER final）と日本語を **1発話ごとに紐づけて表示**（Aligned EN ↔ JA）
+- 会議の「追いつき」補助: **Catch up**（30秒 / 2分 / 5分の範囲を日本語で箇条書き要約。参照IDから該当発話へジャンプ）
 - リアルタイム表示とTXTファイル保存機能
 - 8分のストリーム寿命制限を自動更新で回避
 - **画面スリープ防止機能**（モバイル対応 - Wake Lock API）
@@ -19,7 +20,8 @@ Amazon Bedrock の Nova 2 Sonic を使ったブラウザマイク音声からの
 - **Python 3.12+** （aws_sdk_bedrock_runtime が Python>=3.12 を要求）
 - **uv** パッケージマネージャー
 - AWS アカウントと以下の設定：
-  - Amazon Bedrock で **Nova 2 Sonic** / **Claude 4.5 Haiku** の Model access が有効
+  - Amazon Bedrock で **Nova 2 Sonic** の Model access が有効（必須）
+  - 翻訳 / Catch up を使う場合は **Claude 4.5 Haiku** の Model access も有効
   - 適切な IAM 権限（`bedrock:InvokeModelWithBidirectionalStream` / `bedrock:InvokeModelWithResponseStream` など）
   - 利用リージョン: `ap-northeast-1`（Tokyo）推奨
 
@@ -29,8 +31,8 @@ Amazon Bedrock の Nova 2 Sonic を使ったブラウザマイク音声からの
 
 1. AWS コンソール → Amazon Bedrock
 2. **Model access** で以下を "Access granted" にする
-   - **Amazon Nova 2 Sonic**
-   - **Anthropic Claude 4.5 Haiku**
+   - **Amazon Nova 2 Sonic**（必須）
+   - **Anthropic Claude 4.5 Haiku**（翻訳 / Catch up を使う場合）
 3. Anthropic 系モデルは、初回利用前に **use case details**（利用目的の申請）提出が必要な場合があります  
    エラーに `Model use case details have not been submitted` と出たら、フォームを提出して **15分ほど待ってから**再試行してください
 
@@ -93,15 +95,21 @@ cd /path/to/your/workspace
 プロジェクトルートに `.env` を作成し、AWS認証情報を記入：
 
 ```env
+# === 必須（AWS 認証）===
 AWS_ACCESS_KEY_ID=AKIAxxxxxxxxxxxxxxxx
 AWS_SECRET_ACCESS_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# 一時クレデンシャルの場合のみ（任意）
+# AWS_SESSION_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# 任意（既定: ap-northeast-1）
 AWS_REGION=ap-northeast-1
 
 # 翻訳設定（オプション）
 # 注意: Claude 4.5 Haiku はリージョンによって on-demand throughput が使えず、
 # inference profile の ID/ARN 指定が必要な場合があります
-# 推奨（inference profile 例）:
-TRANSLATION_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0
+# TRANSLATION_MODEL_ID の既定: anthropic.claude-haiku-4-5-20251001-v1:0
+# 推奨（on-demand が使えない環境の inference profile 例）:
+# TRANSLATION_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0
 # on-demand が使える場合の例:
 # TRANSLATION_MODEL_ID=anthropic.claude-haiku-4-5-20251001-v1:0
 # on-demand が使えない場合のフォールバック（必要なら変更）:
@@ -112,9 +120,45 @@ TRANSLATION_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0
 # TRANSLATION_MIN_INTERVAL_SECONDS=0.6
 # TRANSLATION_MAX_BATCH_CHARS=1200
 
+# Catch up（会議の追いつき補助・任意）
+# CATCHUP_MODEL_ID の既定: us.anthropic.claude-haiku-4-5-20251001-v1:0
+# CATCHUP_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0
+# CATCHUP_MODEL_ID_FALLBACK=us.anthropic.claude-haiku-4-5-20251001-v1:0
+# CATCHUP_MAX_TOKENS=350
+# CATCHUP_MIN_INTERVAL_SECONDS=15
+# CATCHUP_LOG_MAX_ITEMS=200
+# CATCHUP_LOG_MAX_SECONDS=1800
+# CATCHUP_MAX_INPUT_CHARS=6000
+
 # デバッグログを有効にする場合（オプション）
 # LOG_LEVEL=DEBUG
 ```
+
+#### 環境変数一覧（必須/任意/デフォルト）
+
+| カテゴリ | 変数 | 必須 | デフォルト | 説明 |
+|---|---|---|---|---|
+| AWS | `AWS_ACCESS_KEY_ID` | 必須 | なし | AWS アクセスキー |
+| AWS | `AWS_SECRET_ACCESS_KEY` | 必須 | なし | AWS シークレットキー |
+| AWS | `AWS_SESSION_TOKEN` | 任意 | なし | 一時クレデンシャルのセッショントークン |
+| AWS | `AWS_REGION` | 任意 | `ap-northeast-1` | Bedrock Runtime のリージョン |
+| App | `LOG_LEVEL` | 任意 | `INFO` | ログレベル（例: `DEBUG`） |
+| 翻訳 | `TRANSLATION_MODEL_ID` | 任意 | `anthropic.claude-haiku-4-5-20251001-v1:0` | 翻訳モデルID（環境によって inference profile 推奨） |
+| 翻訳 | `TRANSLATION_MODEL_ID_FALLBACK` | 任意 | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | on-demand 不可時のフォールバック |
+| 翻訳 | `TRANSLATION_MAX_TOKENS` | 任意 | `400` | 翻訳の最大出力トークン |
+| 翻訳 | `TRANSLATION_DEBOUNCE_SECONDS` | 任意 | `0.4` | 翻訳のまとめ待ち（リクエスト数削減） |
+| 翻訳 | `TRANSLATION_MIN_INTERVAL_SECONDS` | 任意 | `0.6` | 翻訳の最小リクエスト間隔 |
+| 翻訳 | `TRANSLATION_MAX_BATCH_CHARS` | 任意 | `1200` | 翻訳に渡す最大文字数（概算） |
+| Catch up | `CATCHUP_MODEL_ID` | 任意 | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Catch up のモデルID |
+| Catch up | `CATCHUP_MODEL_ID_FALLBACK` | 任意 | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | on-demand 不可時のフォールバック |
+| Catch up | `CATCHUP_MAX_TOKENS` | 任意 | `350` | Catch up の最大出力トークン |
+| Catch up | `CATCHUP_MIN_INTERVAL_SECONDS` | 任意 | `15` | Catch up の連打抑制（秒） |
+| Catch up | `CATCHUP_LOG_MAX_ITEMS` | 任意 | `200` | 会話ログ保持の最大発話数 |
+| Catch up | `CATCHUP_LOG_MAX_SECONDS` | 任意 | `1800` | 会話ログ保持の最大秒数（30分） |
+| Catch up | `CATCHUP_MAX_INPUT_CHARS` | 任意 | `6000` | Catch up に渡す最大文字数（概算） |
+
+**注意**:
+- 翻訳 / Catch up を使う場合、IAM と Bedrock の Model access（Anthropic を含む）が必要です。
 
 **重要**: `.env` ファイルは `.gitignore` に含まれています。Git にコミットしないでください。
 
@@ -170,10 +214,12 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000 --proxy-headers --env-file .e
 
 #### 4. 動作状態の可視化
 
-- ブラウザUIに3つのステータスインジケーターを表示：
+- ブラウザUIに5つのステータスインジケーターを表示（操作バーはスクロールしても上部に追従）：
   - **WebSocket**: 接続状態（緑 = 接続中、赤 = エラー）
-  - **Audio**: マイク音声の受信状態
+  - **Audio**: 音声（Mic/Tab Audio）の受信状態
   - **AWS**: Bedrock との通信状態
+  - **Translation**: 翻訳の状態（Translating/Throttled/Disabled など）
+  - **Catch up**: 追いつき機能の状態（Generating/Ready/Throttled など）
 - サーバー側ログでも詳細な状態を確認可能
 
 ### 高パフォーマンス実行（本番環境向け）
@@ -209,14 +255,16 @@ uv add uvloop httptools websockets
 ## 使い方
 
 1. ブラウザで `http://localhost:8000` にアクセス
-2. **Start** ボタンをクリック
-3. マイク権限を許可
-4. 英語で話すと、リアルタイムで英語文字起こしが表示されます（partial/final）
-5. **final（確定）** テキスト（USERロール）のみ、日本語翻訳が下部にストリーミング表示されます
-6. **Aligned EN ↔ JA** で、英語（発話）と日本語（翻訳）が行単位で対応表示されます（スマホ幅では自動的に縦積み）
-6. **Download TXT** で英語文字起こし + 日本語翻訳をテキストファイルとして保存
-7. **Clear** で文字起こし/翻訳の両方をクリア
-8. **Stop** で録音を停止
+2. 画面上部の **Input** を選択（既定: `Mic`）
+3. **Start** ボタンをクリック
+4. `Mic` の場合: マイク権限を許可 / `Tab Audio` の場合: 共有ダイアログで **タブ**を選び、`Share tab audio` を有効化
+5. 英語で話す（またはタブ音声を再生する）と、リアルタイムで英語文字起こしが表示されます（partial/final）
+6. **final（確定）** テキスト（USERロール）のみ、日本語翻訳が下部にストリーミング表示されます
+7. **Aligned EN ↔ JA** で、英語（発話）と日本語（翻訳）が行単位で対応表示されます（スマホ幅では自動的に縦積み）
+8. **Catch up**（30s / 2m / 5m）で、直近の会話に日本語の箇条書きで追いつけます（参照IDを押すと該当行へジャンプ）
+9. **Download TXT** で英語文字起こし + 日本語翻訳をテキストファイルとして保存
+10. **Clear** で文字起こし/翻訳/会話ログ/追いつき結果をクリア
+11. **Stop** で録音を停止（`Tab Audio` は共有停止でも自動停止します）
 
 ### セッション自動更新
 
@@ -315,6 +363,13 @@ Bedrock のストリーム寿命（8分）を回避するため、7分45秒ご�
 - `localhost` または HTTPS で開いているか確認（ブラウザの仕様で制限あり）
 - OS 側のマイク権限を確認
 
+### Tab Audio が入らない（Chrome/Edge）
+
+- 画面上部の **Input** を `Tab Audio` にして Start
+- `localhost` または HTTPS で開いているか確認（ブラウザの仕様で制限あり）
+- 共有ダイアログで「画面」や「ウィンドウ」ではなく **タブ**を選び、`Share tab audio` を有効化
+- タブがミュートされていないか、再生音量が 0 になっていないか確認
+
 ### Import エラー
 
 - Python 3.12 以上を使用しているか確認：
@@ -352,7 +407,7 @@ Bedrock のストリーム寿命（8分）を回避するため、7分45秒ご�
 
 ### ブラウザ側（UI）
 
-画面上部に3つのステータスインジケーターが表示されます：
+画面上部に5つのステータスインジケーターが表示されます（操作バーはスクロールしても上部に追従します）：
 
 - **WebSocket** (緑点滅 = 正常):
   - Connected: サーバーとの接続が確立
@@ -360,7 +415,7 @@ Bedrock のストリーム寿命（8分）を回避するため、7分45秒ご�
   - Error (赤): 接続エラー
 
 - **Audio** (緑点滅 = 正常):
-  - Capturing: マイク音声を取得中
+  - Capturing: 音声（Mic/Tab）を取得中
   - Receiving: 音声データをサーバーに送信中
   - Idle: 待機中
 
@@ -368,6 +423,18 @@ Bedrock のストリーム寿命（8分）を回避するため、7分45秒ご�
   - Connected: Bedrock に接続済み
   - Transcribing: 文字起こし処理中
   - Error (赤): AWS接続エラー
+
+- **Translation**:
+  - Idle: 待機中
+  - Translating: 翻訳処理中
+  - Throttled: 混雑（スロットリング）中
+  - Disabled / Error: 利用不可またはエラー
+
+- **Catch up**:
+  - Idle: 待機中
+  - Generating: 生成中
+  - Ready: 結果表示可能
+  - Throttled / Error: 混雑またはエラー
 
 ### サーバー側（ログ）
 

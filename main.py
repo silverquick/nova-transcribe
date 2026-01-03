@@ -1,5 +1,6 @@
 import asyncio
 import base64
+from collections import deque
 import json
 import logging
 import os
@@ -65,6 +66,15 @@ TRANSLATION_MAX_TOKENS = int(os.getenv("TRANSLATION_MAX_TOKENS", "400"))
 TRANSLATION_DEBOUNCE_SECONDS = float(os.getenv("TRANSLATION_DEBOUNCE_SECONDS", "0.4"))
 TRANSLATION_MIN_INTERVAL_SECONDS = float(os.getenv("TRANSLATION_MIN_INTERVAL_SECONDS", "0.6"))
 TRANSLATION_MAX_BATCH_CHARS = int(os.getenv("TRANSLATION_MAX_BATCH_CHARS", "1200"))
+
+CATCHUP_MODEL_ID_DEFAULT = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+CATCHUP_MODEL_ID = os.getenv("CATCHUP_MODEL_ID", CATCHUP_MODEL_ID_DEFAULT)
+CATCHUP_MODEL_ID_FALLBACK = os.getenv("CATCHUP_MODEL_ID_FALLBACK", CATCHUP_MODEL_ID_DEFAULT)
+CATCHUP_MAX_TOKENS = int(os.getenv("CATCHUP_MAX_TOKENS", "350"))
+CATCHUP_MIN_INTERVAL_SECONDS = float(os.getenv("CATCHUP_MIN_INTERVAL_SECONDS", "15"))
+CATCHUP_LOG_MAX_ITEMS = int(os.getenv("CATCHUP_LOG_MAX_ITEMS", "200"))
+CATCHUP_LOG_MAX_SECONDS = int(os.getenv("CATCHUP_LOG_MAX_SECONDS", "1800"))
+CATCHUP_MAX_INPUT_CHARS = int(os.getenv("CATCHUP_MAX_INPUT_CHARS", "6000"))
 AWS_REGION_DEFAULT = "ap-northeast-1"
 
 # Bedrock側ストリーム寿命(8分)手前で更新
@@ -408,6 +418,19 @@ def _parse_indexed_output_line(line: str) -> Optional[tuple[int, str]]:
     return idx, ja
 
 
+def _extract_first_json_object(text: str) -> Optional[str]:
+    """
+    LLM の出力から最初の JSON オブジェクト部分を抜き出す（前後に余計な文字が付くケース対策）。
+    """
+    if not text:
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    return text[start : end + 1]
+
+
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -420,6 +443,7 @@ async def ws_endpoint(websocket: WebSocket):
     # キューを浅くしてリアルタイム性を確保（20フレーム = 2秒分、古いフレームは破棄）
     audio_q: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=20)
     translation_q: asyncio.Queue[dict] = asyncio.Queue(maxsize=50)
+    catchup_q: asyncio.Queue[dict] = asyncio.Queue(maxsize=1)
 
     # シンプルなプロンプトで低遅延化
     system_prompt = "Transcribe the user's speech into text accurately."
@@ -429,6 +453,27 @@ async def ws_endpoint(websocket: WebSocket):
 
     session: Optional[NovaSonicSession] = None
     output_task: Optional[asyncio.Task] = None
+
+    async def safe_send(payload: dict) -> bool:
+        """
+        WebSocket 切断後に background task が send してしまうケースを安全に無視する。
+        """
+        if stop_event.is_set():
+            return False
+        try:
+            await websocket.send_text(json.dumps(payload))
+            return True
+        except RuntimeError as e:
+            # 例: Unexpected ASGI message 'websocket.send', after sending 'websocket.close'
+            if "Unexpected ASGI message" in str(e):
+                return False
+            return False
+        except Exception:
+            return False
+
+    # 会議ログ（USER final を時刻付きで保持。翻訳が届いたら ja を追記）
+    utterance_log: deque[dict] = deque()
+    utterance_by_id: dict[str, dict] = {}
 
     # 統計情報
     audio_frame_count = 0
@@ -441,14 +486,40 @@ async def ws_endpoint(websocket: WebSocket):
     translation_segment_seq = 0
     translation_model_id_in_use = TRANSLATION_MODEL_ID
     translation_model_id_fallback = TRANSLATION_MODEL_ID_FALLBACK
+    conversation_epoch = 0
+
+    catchup_count = 0
+    catchup_model_id_in_use = CATCHUP_MODEL_ID
+    catchup_model_id_fallback = CATCHUP_MODEL_ID_FALLBACK
 
     logger.info(
         "Translation model configured: "
         f"primary='{translation_model_id_in_use}', fallback='{translation_model_id_fallback}'"
     )
+    logger.info(
+        "Catch-up model configured: "
+        f"primary='{catchup_model_id_in_use}', fallback='{catchup_model_id_fallback}'"
+    )
+
+    def _prune_utterance_log(now_ts: float) -> None:
+        while len(utterance_log) > CATCHUP_LOG_MAX_ITEMS:
+            old = utterance_log.popleft()
+            try:
+                utterance_by_id.pop(old.get("id"), None)
+            except Exception:
+                pass
+        while utterance_log:
+            oldest = utterance_log[0]
+            if now_ts - float(oldest.get("ts", now_ts)) <= CATCHUP_LOG_MAX_SECONDS:
+                break
+            old = utterance_log.popleft()
+            try:
+                utterance_by_id.pop(old.get("id"), None)
+            except Exception:
+                pass
 
     async def translation_worker():
-        nonlocal translation_count, translation_model_id_in_use, translation_enabled, translation_disabled_reason
+        nonlocal translation_count, translation_model_id_in_use, translation_enabled, translation_disabled_reason, conversation_epoch
         logger.info("translation_worker task started, waiting for translation requests...")
         last_request_at = 0.0
         backoff_seconds = 0.0
@@ -462,10 +533,13 @@ async def ws_endpoint(websocket: WebSocket):
                 break
             if not translation_enabled:
                 continue
+            if first_item.get("epoch") != conversation_epoch:
+                continue
 
             # Debounce: 少し待って複数の final セグメントをまとめて翻訳（リクエスト数削減）
             batch_items = [first_item]
             batch_chars = len((first_item.get("en") or "").strip())
+            batch_epoch = first_item.get("epoch")
             start = time.monotonic()
             while batch_chars < TRANSLATION_MAX_BATCH_CHARS:
                 remaining = TRANSLATION_DEBOUNCE_SECONDS - (time.monotonic() - start)
@@ -479,6 +553,8 @@ async def ws_endpoint(websocket: WebSocket):
                     return
                 if not nxt:
                     continue
+                if nxt.get("epoch") != batch_epoch:
+                    continue
                 batch_items.append(nxt)
                 batch_chars += len((nxt.get("en") or "").strip())
 
@@ -490,6 +566,8 @@ async def ws_endpoint(websocket: WebSocket):
                     continue
                 pending_items.append({"id": seg_id, "en": en})
             if not pending_items:
+                continue
+            if batch_epoch != conversation_epoch:
                 continue
 
             translation_count += 1
@@ -508,6 +586,9 @@ async def ws_endpoint(websocket: WebSocket):
                 last_request_at = time.monotonic()
 
                 try:
+                    if not await safe_send({"type": "status", "status": "translation_translating"}):
+                        return
+
                     # バッチ入力を "N<TAB>English" で渡し、出力も同形式を要求する（英日対応づけ用）
                     input_lines = []
                     for i, it in enumerate(pending_items, start=1):
@@ -525,6 +606,10 @@ async def ws_endpoint(websocket: WebSocket):
                     async for delta in stream_prompt_text_deltas(
                         client, prompt=prompt, model_id=translation_model_id_in_use
                     ):
+                        if batch_epoch != conversation_epoch:
+                            buffer = ""
+                            pending_items = []
+                            break
                         buffer += delta
                         while "\n" in buffer:
                             line, buffer = buffer.split("\n", 1)
@@ -534,9 +619,14 @@ async def ws_endpoint(websocket: WebSocket):
                             idx, ja = parsed
                             if 1 <= idx <= len(pending_items):
                                 seg_id = pending_items[idx - 1]["id"]
-                                await websocket.send_text(
-                                    json.dumps({"type": "aligned_ja", "id": seg_id, "ja": ja})
-                                )
+                                try:
+                                    ut = utterance_by_id.get(seg_id)
+                                    if ut is not None:
+                                        ut["ja"] = ja
+                                except Exception:
+                                    pass
+                                if not await safe_send({"type": "aligned_ja", "id": seg_id, "ja": ja}):
+                                    return
 
                     # 最後に改行が来ないケース
                     parsed_last = _parse_indexed_output_line(buffer)
@@ -544,17 +634,25 @@ async def ws_endpoint(websocket: WebSocket):
                         idx, ja = parsed_last
                         if 1 <= idx <= len(pending_items):
                             seg_id = pending_items[idx - 1]["id"]
-                            await websocket.send_text(
-                                json.dumps({"type": "aligned_ja", "id": seg_id, "ja": ja})
-                            )
+                            try:
+                                ut = utterance_by_id.get(seg_id)
+                                if ut is not None:
+                                    ut["ja"] = ja
+                            except Exception:
+                                pass
+                            if not await safe_send({"type": "aligned_ja", "id": seg_id, "ja": ja}):
+                                return
 
                     backoff_seconds = 0.0
+                    if not await safe_send({"type": "status", "status": "translation_idle"}):
+                        return
                     break
 
                 except ResourceNotFoundException as e:
                     message_raw = getattr(e, "message", None) or str(e) or ""
                     message = message_raw.lower()
                     if "use case details" in message and "anthropic" in message:
+                        await safe_send({"type": "status", "status": "translation_disabled"})
                         translation_enabled = False
                         translation_disabled_reason = message_raw
                         logger.error(
@@ -587,12 +685,8 @@ async def ws_endpoint(websocket: WebSocket):
                         break
 
                     logger.error(f"Translation error: {e}", exc_info=True)
-                    try:
-                        await websocket.send_text(
-                            json.dumps({"type": "translation_error", "error": str(e)})
-                        )
-                    except Exception:
-                        break
+                    await safe_send({"type": "status", "status": "translation_error"})
+                    await safe_send({"type": "translation_error", "error": str(e)})
                     break
 
                 except ValidationException as e:
@@ -624,12 +718,8 @@ async def ws_endpoint(websocket: WebSocket):
                         continue
 
                     logger.error(f"Translation error: {e}", exc_info=True)
-                    try:
-                        await websocket.send_text(
-                            json.dumps({"type": "translation_error", "error": str(e)})
-                        )
-                    except Exception:
-                        break
+                    await safe_send({"type": "status", "status": "translation_error"})
+                    await safe_send({"type": "translation_error", "error": str(e)})
                     break
 
                 except ThrottlingException as e:
@@ -638,23 +728,21 @@ async def ws_endpoint(websocket: WebSocket):
                     logger.warning(
                         f"Translation throttled. Backing off {backoff_seconds:.1f}s: {e}"
                     )
-                    try:
-                        await websocket.send_text(
-                            json.dumps(
-                                {
-                                    "type": "info",
-                                    "text": f"翻訳が混雑しています。{backoff_seconds:.1f}秒待って再試行します…",
-                                }
-                            )
-                        )
-                    except Exception:
-                        pass
+                    await safe_send({"type": "status", "status": "translation_throttled"})
+                    await safe_send(
+                        {
+                            "type": "info",
+                            "text": f"翻訳が混雑しています。{backoff_seconds:.1f}秒待って再試行します…",
+                        }
+                    )
 
                     # 待機中に溜まった分をまとめる（ただしサイズ上限まで）
                     try:
                         while sum(len(x["en"]) for x in pending_items) < TRANSLATION_MAX_BATCH_CHARS:
                             nxt = translation_q.get_nowait()
                             if not nxt:
+                                continue
+                            if nxt.get("epoch") != batch_epoch:
                                 continue
                             seg_id = nxt.get("id")
                             en = (nxt.get("en") or "").replace("\n", " ").strip()
@@ -671,18 +759,231 @@ async def ws_endpoint(websocket: WebSocket):
 
                 except Exception as e:
                     logger.error(f"Translation error: {e}", exc_info=True)
-                    try:
-                        await websocket.send_text(
-                            json.dumps({"type": "translation_error", "error": str(e)})
-                        )
-                    except Exception:
-                        break
+                    await safe_send({"type": "status", "status": "translation_error"})
+                    await safe_send({"type": "translation_error", "error": str(e)})
                     break
 
         logger.info(
             "translation_worker task ended. "
             f"Total translations: {translation_count}, stop_event: {stop_event.is_set()}"
         )
+
+    async def catchup_worker():
+        nonlocal catchup_count, catchup_model_id_in_use, conversation_epoch
+        logger.info("catchup_worker task started, waiting for catch-up requests...")
+        last_request_at = 0.0
+        while not stop_event.is_set():
+            try:
+                req = await catchup_q.get()
+            except asyncio.CancelledError:
+                break
+
+            if stop_event.is_set():
+                break
+            if req.get("epoch") != conversation_epoch:
+                continue
+
+            seconds = int(req.get("seconds") or 120)
+            seconds = max(10, min(seconds, CATCHUP_LOG_MAX_SECONDS))
+            batch_epoch = req.get("epoch")
+
+            # リクエスト間隔を空ける（翻訳とは別に抑制）
+            now_mono = time.monotonic()
+            wait_for = (last_request_at + CATCHUP_MIN_INTERVAL_SECONDS) - now_mono
+            if wait_for > 0:
+                await safe_send({"type": "status", "status": "catchup_generating"})
+                await safe_send(
+                    {
+                        "type": "info",
+                        "text": f"Catch up は短時間に連続実行できません（{wait_for:.0f}秒後に実行します）…",
+                    }
+                )
+                await asyncio.sleep(wait_for)
+
+            last_request_at = time.monotonic()
+            if batch_epoch != conversation_epoch:
+                continue
+
+            if not await safe_send({"type": "status", "status": "catchup_generating"}):
+                return
+
+            now_ts = time.time()
+            cutoff = now_ts - seconds
+            _prune_utterance_log(now_ts)
+
+            window_items = [u for u in utterance_log if float(u.get("ts", 0)) >= cutoff]
+            if not window_items:
+                if not await safe_send(
+                    {
+                        "type": "catchup_result",
+                        "window_seconds": seconds,
+                        "topic": "",
+                        "important_points": [],
+                        "decisions": [],
+                        "next_topic": "",
+                    }
+                ):
+                    return
+                await safe_send({"type": "status", "status": "catchup_ready"})
+                continue
+
+            # 入力が長すぎる場合は末尾（最新）から詰める
+            chosen: list[dict] = []
+            total_chars = 0
+            for u in reversed(window_items):
+                en = (u.get("en") or "").strip()
+                ja = (u.get("ja") or "").strip()
+                block = f"{u.get('id')}\nEN: {en}\n"
+                if ja:
+                    block += f"JA: {ja}\n"
+                block += "\n"
+                if total_chars + len(block) > CATCHUP_MAX_INPUT_CHARS and chosen:
+                    break
+                chosen.append(u)
+                total_chars += len(block)
+            chosen.reverse()
+
+            transcript_blocks = []
+            for u in chosen:
+                seg_id = u.get("id")
+                en = (u.get("en") or "").strip()
+                ja = (u.get("ja") or "").strip()
+                if not seg_id or not en:
+                    continue
+                transcript_blocks.append(f"{seg_id}\nEN: {en}")
+                if ja:
+                    transcript_blocks.append(f"JA: {ja}")
+                transcript_blocks.append("")
+            transcript_text = "\n".join(transcript_blocks).strip()
+
+            catchup_count += 1
+            logger.info(
+                f"Catch up request #{catchup_count}: window={seconds}s, segments={len(chosen)}, chars={len(transcript_text)}"
+            )
+
+            prompt = (
+                "You are a meeting catch-up assistant.\n"
+                "A user lost track of the conversation and needs a quick catch-up.\n\n"
+                "You will receive transcript segments with IDs like u12.\n"
+                "Each segment may have EN and sometimes JA.\n"
+                "Use JA when available; otherwise use EN.\n\n"
+                "Return ONLY valid JSON (no markdown), with this schema:\n"
+                "{\n"
+                '  "topic": string,\n'
+                '  "important_points": [{"text": string, "ids": ["u12", "..."]}],\n'
+                '  "decisions": [{"text": string, "ids": ["u12", "..."]}],\n'
+                '  "next_topic": string\n'
+                "}\n\n"
+                "Rules:\n"
+                "- All strings must be Japanese.\n"
+                "- Keep it concise and practical for a meeting.\n"
+                "- For each bullet, include 1-3 supporting ids when possible.\n"
+                "- Do not invent facts not present in the transcript.\n\n"
+                f"Time window: last {seconds} seconds.\n\n"
+                "Transcript:\n"
+                f"{transcript_text}\n"
+            )
+
+            try:
+                buf = ""
+                async for delta in stream_prompt_text_deltas(
+                    client, prompt=prompt, model_id=catchup_model_id_in_use
+                ):
+                    if batch_epoch != conversation_epoch:
+                        buf = ""
+                        break
+                    buf += delta
+
+                if batch_epoch != conversation_epoch or not buf.strip():
+                    continue
+
+                json_part = _extract_first_json_object(buf)
+                parsed = json.loads(json_part) if json_part else None
+                if not isinstance(parsed, dict):
+                    raise ValueError("Invalid JSON from model")
+
+                topic = str(parsed.get("topic") or "")
+                important_points = parsed.get("important_points") or []
+                decisions = parsed.get("decisions") or []
+                next_topic = str(parsed.get("next_topic") or "")
+
+                def _norm_items(items):
+                    out = []
+                    if not isinstance(items, list):
+                        return out
+                    for it in items:
+                        if not isinstance(it, dict):
+                            continue
+                        text = str(it.get("text") or "").strip()
+                        ids = it.get("ids") or []
+                        if not isinstance(ids, list):
+                            ids = []
+                        ids = [str(x) for x in ids if isinstance(x, (str, int))]
+                        ids = [i for i in ids if i.startswith("u")]
+                        if text:
+                            out.append({"text": text, "ids": ids[:3]})
+                    return out
+
+                msg = {
+                    "type": "catchup_result",
+                    "window_seconds": seconds,
+                    "topic": topic,
+                    "important_points": _norm_items(important_points),
+                    "decisions": _norm_items(decisions),
+                    "next_topic": next_topic,
+                }
+                if not await safe_send(msg):
+                    return
+                await safe_send({"type": "status", "status": "catchup_ready"})
+
+            except ValidationException as e:
+                message = (getattr(e, "message", None) or str(e) or "").lower()
+                if (
+                    "on-demand throughput" in message
+                    and "inference profile" in message
+                    and catchup_model_id_in_use != catchup_model_id_fallback
+                ):
+                    logger.warning(
+                        "Catch-up model does not support on-demand throughput. "
+                        f"Switching to inference profile: {catchup_model_id_fallback}"
+                    )
+                    catchup_model_id_in_use = catchup_model_id_fallback
+                    try:
+                        await websocket.send_text(
+                            json.dumps(
+                                {
+                                    "type": "info",
+                                    "text": (
+                                        "Catch up モデルを inference profile に切り替えました: "
+                                        f"model_id={catchup_model_id_in_use}"
+                                    ),
+                                }
+                            )
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+                logger.error(f"Catch up error: {e}", exc_info=True)
+                await safe_send({"type": "status", "status": "catchup_error"})
+                await safe_send({"type": "catchup_error", "error": str(e)})
+
+            except ThrottlingException as e:
+                logger.warning(f"Catch up throttled: {e}")
+                await safe_send({"type": "status", "status": "catchup_throttled"})
+                await safe_send(
+                    {
+                        "type": "catchup_error",
+                        "error": "混雑しています。少し待ってから再試行してください。",
+                    }
+                )
+
+            except Exception as e:
+                logger.error(f"Catch up error: {e}", exc_info=True)
+                await safe_send({"type": "status", "status": "catchup_error"})
+                await safe_send({"type": "catchup_error", "error": str(e)})
+
+        logger.info("catchup_worker task ended.")
 
     async def start_session():
         nonlocal session, output_task
@@ -765,10 +1066,21 @@ async def ws_endpoint(websocket: WebSocket):
                             try:
                                 translation_segment_seq += 1
                                 seg_id = f"u{translation_segment_seq}"
+                                now_ts = time.time()
+                                ut = {
+                                    "id": seg_id,
+                                    "ts": now_ts,
+                                    "en": text,
+                                    "ja": "",
+                                    "epoch": conversation_epoch,
+                                }
+                                utterance_log.append(ut)
+                                utterance_by_id[seg_id] = ut
+                                _prune_utterance_log(now_ts)
                                 await websocket.send_text(
                                     json.dumps({"type": "aligned_en", "id": seg_id, "en": text})
                                 )
-                                translation_q.put_nowait({"id": seg_id, "en": text})
+                                translation_q.put_nowait({"epoch": conversation_epoch, "id": seg_id, "en": text})
                             except asyncio.QueueFull:
                                 # キューが満杯の場合、古いリクエストを破棄して新しい翻訳を優先（リアルタイム性優先）
                                 try:
@@ -778,10 +1090,21 @@ async def ws_endpoint(websocket: WebSocket):
                                 try:
                                     translation_segment_seq += 1
                                     seg_id = f"u{translation_segment_seq}"
+                                    now_ts = time.time()
+                                    ut = {
+                                        "id": seg_id,
+                                        "ts": now_ts,
+                                        "en": text,
+                                        "ja": "",
+                                        "epoch": conversation_epoch,
+                                    }
+                                    utterance_log.append(ut)
+                                    utterance_by_id[seg_id] = ut
+                                    _prune_utterance_log(now_ts)
                                     await websocket.send_text(
                                         json.dumps({"type": "aligned_en", "id": seg_id, "en": text})
                                     )
-                                    translation_q.put_nowait({"id": seg_id, "en": text})
+                                    translation_q.put_nowait({"epoch": conversation_epoch, "id": seg_id, "en": text})
                                     logger.warning(
                                         "Translation queue full, dropped oldest translation request to insert new one"
                                     )
@@ -842,7 +1165,7 @@ async def ws_endpoint(websocket: WebSocket):
                 break
 
     async def recv_from_browser():
-        nonlocal audio_frame_count, last_audio_time, translation_started
+        nonlocal audio_frame_count, last_audio_time, translation_started, translation_segment_seq, conversation_epoch
         try:
             while not stop_event.is_set():
                 message = await websocket.receive()
@@ -857,11 +1180,40 @@ async def ws_endpoint(websocket: WebSocket):
                             # ブラウザ側で表示がクリアされたので、区切り用の先頭改行を抑制し、
                             # 追いかけている翻訳キューも捨てて表示と整合させる
                             translation_started = False
+                            conversation_epoch += 1
+                            translation_segment_seq = 0
+                            utterance_log.clear()
+                            utterance_by_id.clear()
+                            try:
+                                await websocket.send_text(json.dumps({"type": "status", "status": "translation_idle"}))
+                                await websocket.send_text(json.dumps({"type": "status", "status": "catchup_idle"}))
+                            except Exception:
+                                break
                             try:
                                 while True:
                                     translation_q.get_nowait()
                             except asyncio.QueueEmpty:
                                 pass
+                            try:
+                                while True:
+                                    catchup_q.get_nowait()
+                            except asyncio.QueueEmpty:
+                                pass
+                        elif msg.get("type") == "catchup":
+                            seconds = int(msg.get("seconds") or 120)
+                            seconds = max(10, min(seconds, CATCHUP_LOG_MAX_SECONDS))
+                            req = {"epoch": conversation_epoch, "seconds": seconds}
+                            try:
+                                catchup_q.put_nowait(req)
+                            except asyncio.QueueFull:
+                                try:
+                                    catchup_q.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    pass
+                                try:
+                                    catchup_q.put_nowait(req)
+                                except asyncio.QueueFull:
+                                    pass
                     except json.JSONDecodeError:
                         logger.warning(f"Invalid JSON received: {message['text'][:100]}")
 
@@ -935,6 +1287,7 @@ async def ws_endpoint(websocket: WebSocket):
         asyncio.create_task(recv_from_browser()),
         asyncio.create_task(send_to_bedrock()),
         asyncio.create_task(translation_worker()),
+        asyncio.create_task(catchup_worker()),
     ]
 
     try:
@@ -966,16 +1319,63 @@ async def index():
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Nova 2 Sonic – Real-time Transcription (English)</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 20px; background: #f6f7f9; }
-    h1 { margin: 0 0 6px 0; font-size: 20px; }
-    .sub { color: #555; margin-bottom: 14px; }
+    :root {
+      color-scheme: dark;
+      --bg: #0b0f17;
+      --bg-elev: #0f172a;
+      --panel: #0f172a;
+      --panel-2: #0b1220;
+      --border: #243244;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --muted-2: #6b7280;
+      --code-bg: #111827;
+      --btn-bg: #111827;
+      --btn-hover: #1f2937;
+      --btn-border: #2b3648;
+      --shadow: 0 1px 0 rgba(0,0,0,0.25);
+    }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 20px; background: var(--bg); color: var(--text); }
+    h1 { margin: 0 0 6px 0; font-size: 20px; color: var(--text); }
+    .sub { color: var(--muted); margin-bottom: 14px; }
     .controls { display: flex; gap: 10px; flex-wrap: wrap; margin: 14px 0; align-items: center; }
-    button { padding: 10px 14px; font-size: 14px; cursor: pointer; }
-    button:disabled { opacity: 0.6; cursor: not-allowed; }
-    #status { font-size: 13px; color: #333; }
+    button {
+      padding: 10px 14px;
+      font-size: 14px;
+      cursor: pointer;
+      color: var(--text);
+      background: var(--btn-bg);
+      border: 1px solid var(--btn-border);
+      border-radius: 10px;
+      box-shadow: var(--shadow);
+    }
+    button:hover { background: var(--btn-hover); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    #status { font-size: 13px; color: var(--muted); }
+    select {
+      padding: 10px 12px;
+      font-size: 14px;
+      color: var(--text);
+      background: var(--btn-bg);
+      border: 1px solid var(--btn-border);
+      border-radius: 10px;
+      box-shadow: var(--shadow);
+    }
+    select:disabled { opacity: 0.55; }
+    option { background: var(--btn-bg); color: var(--text); }
+    .sticky-bar {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      background: var(--bg);
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .sticky-bar .controls { margin: 0; }
+    .sticky-bar .status-indicators { margin: 10px 0 0 0; }
     .status-indicators { display: flex; gap: 12px; margin: 10px 0; font-size: 13px; }
-    .indicator { display: flex; align-items: center; gap: 6px; }
-    .indicator-dot { width: 10px; height: 10px; border-radius: 50%; background: #ccc; }
+    .indicator { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+    .indicator-dot { width: 10px; height: 10px; border-radius: 50%; background: #4b5563; }
     .indicator-dot.active { background: #22c55e; animation: pulse 2s infinite; }
     .indicator-dot.error { background: #ef4444; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
@@ -984,8 +1384,8 @@ async def index():
       min-height: 360px;
       max-height: 500px;
       overflow-y: auto;
-      background: #fff;
-      border: 1px solid #d9dde3;
+      background: var(--panel);
+      border: 1px solid var(--border);
       padding: 14px;
       border-radius: 10px;
       font-size: 16px;
@@ -996,8 +1396,8 @@ async def index():
       min-height: 360px;
       max-height: 500px;
       overflow-y: auto;
-      background: #f9fafb;
-      border: 1px solid #d9dde3;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
       padding: 14px;
       border-radius: 10px;
       font-size: 16px;
@@ -1008,8 +1408,8 @@ async def index():
       min-height: 360px;
       max-height: 500px;
       overflow-y: auto;
-      background: #fff;
-      border: 1px solid #d9dde3;
+      background: var(--panel);
+      border: 1px solid var(--border);
       border-radius: 10px;
       margin-top: 12px;
     }
@@ -1018,14 +1418,14 @@ async def index():
       grid-template-columns: 1fr 1fr;
       gap: 12px;
       padding: 12px 14px;
-      border-bottom: 1px solid #eef2f7;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
     }
-    .pair:hover { background: #f1f5ff; }
+    .pair:hover { background: rgba(255,255,255,0.04); }
     .pair:last-child { border-bottom: 0; }
     .pair-col { white-space: pre-wrap; }
     .pair-col::before { display: none; }
-    .pair-en { color: #1f2937; }
-    .pair-ja { color: #0f766e; }
+    .pair-en { color: var(--text); }
+    .pair-ja { color: #5eead4; }
     @media (max-width: 720px) {
       .pair { grid-template-columns: 1fr; gap: 10px; }
       .pair-col::before {
@@ -1034,38 +1434,80 @@ async def index():
         font-size: 11px;
         font-weight: 600;
         letter-spacing: 0.04em;
-        color: #6b7280;
+        color: var(--muted-2);
         margin-bottom: 6px;
       }
     }
-    .hint { margin-top: 10px; font-size: 12px; color: #666; }
-    code { background: #eef1f5; padding: 1px 4px; border-radius: 4px; }
+    #catchup {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      padding: 14px;
+      border-radius: 10px;
+      margin-top: 12px;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    #catchup ul { margin: 8px 0 0 0; padding-left: 18px; }
+    .catchup-meta { color: var(--muted); font-size: 12px; }
+    .catchup-refs { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+    .ref-chip {
+      font-size: 12px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: rgba(99,102,241,0.14);
+      color: #c7d2fe;
+      cursor: pointer;
+      user-select: none;
+    }
+    .ref-chip:hover { background: rgba(99,102,241,0.22); }
+    .pair.selected { background: rgba(245,158,11,0.14); box-shadow: inset 0 0 0 1px rgba(245,158,11,0.45); }
+    .hint { margin-top: 10px; font-size: 12px; color: var(--muted); }
+    code { background: var(--code-bg); padding: 1px 4px; border-radius: 4px; color: var(--text); border: 1px solid rgba(255,255,255,0.08); }
   </style>
 </head>
 <body>
   <h1>Amazon Nova 2 Sonic – Real-time Transcription</h1>
   <div class="sub">Language: <b>English</b> (audio input: 16 kHz, mono, 16-bit PCM)</div>
 
-  <div class="controls">
-    <button id="start">Start</button>
-    <button id="stop" disabled>Stop</button>
-    <button id="download" disabled>Download TXT</button>
-    <button id="clear" disabled>Clear</button>
-    <div id="status"></div>
-  </div>
+  <div class="sticky-bar">
+    <div class="controls">
+      <button id="start">Start</button>
+      <button id="stop" disabled>Stop</button>
+      <button id="download" disabled>Download TXT</button>
+      <button id="clear" disabled>Clear</button>
+      <span style="margin-left: 8px; font-size: 12px; color: var(--muted);">Input:</span>
+      <select id="input-source">
+        <option value="mic" selected>Mic</option>
+        <option value="tab">Tab Audio (Chrome/Edge)</option>
+      </select>
+      <span style="margin-left: 8px; font-size: 12px; color: var(--muted);">Catch up:</span>
+      <button id="catchup30" disabled>30s</button>
+      <button id="catchup120" disabled>2m</button>
+      <button id="catchup300" disabled>5m</button>
+      <div id="status"></div>
+    </div>
 
-  <div class="status-indicators">
-    <div class="indicator">
-      <div class="indicator-dot" id="ws-indicator"></div>
-      <span>WebSocket: <span id="ws-status">Disconnected</span></span>
-    </div>
-    <div class="indicator">
-      <div class="indicator-dot" id="audio-indicator"></div>
-      <span>Audio: <span id="audio-status">Idle</span></span>
-    </div>
-    <div class="indicator">
-      <div class="indicator-dot" id="aws-indicator"></div>
-      <span>AWS: <span id="aws-status">Idle</span></span>
+    <div class="status-indicators">
+      <div class="indicator">
+        <div class="indicator-dot" id="ws-indicator"></div>
+        <span>WebSocket: <span id="ws-status">Disconnected</span></span>
+      </div>
+      <div class="indicator">
+        <div class="indicator-dot" id="audio-indicator"></div>
+        <span>Audio: <span id="audio-status">Idle</span></span>
+      </div>
+      <div class="indicator">
+        <div class="indicator-dot" id="aws-indicator"></div>
+        <span>AWS: <span id="aws-status">Idle</span></span>
+      </div>
+      <div class="indicator">
+        <div class="indicator-dot" id="translation-indicator"></div>
+        <span>Translation: <span id="translation-status">Idle</span></span>
+      </div>
+      <div class="indicator">
+        <div class="indicator-dot" id="catchup-indicator"></div>
+        <span>Catch up: <span id="catchup-status">Idle</span></span>
+      </div>
     </div>
   </div>
 
@@ -1074,21 +1516,25 @@ async def index():
   <div id="translation">…</div>
   <h3>Aligned EN ↔ JA (USER final)</h3>
   <div id="pairs">…</div>
+  <h3>Catch up</h3>
+  <div id="catchup">Press a button (30s / 2m / 5m) to catch up.</div>
   <div class="hint">
     If you deploy behind HTTPS, this page will automatically use <code>wss://</code>. Microphone access requires a secure context (HTTPS or localhost).
     <br>Status indicators show connection health in real-time.
   </div>
 
 <script>
-(() => {
-  let ws = null;
-  let audioContext = null;
-  let sourceNode = null;
-  let workletNode = null;
-  let legacyProcessor = null;
-  let pingInterval = null;
-  let wakeLock = null;
-  let useAudioWorklet = false;
+	(() => {
+	  let ws = null;
+	  let audioContext = null;
+      let captureStream = null;
+	  let sourceNode = null;
+	  let workletNode = null;
+	  let legacyProcessor = null;
+	  let pingInterval = null;
+	  let wakeLock = null;
+	  let useAudioWorklet = false;
+      let stopping = false;
 
   let finalText = "";
   let partialText = "";
@@ -1114,28 +1560,40 @@ async def index():
       const pairsDiv = document.getElementById("pairs");
 	  const statusDiv = document.getElementById("status");
 	  const startBtn = document.getElementById("start");
-	  const stopBtn = document.getElementById("stop");
-	  const downloadBtn = document.getElementById("download");
-	  const clearBtn = document.getElementById("clear");
+		  const stopBtn = document.getElementById("stop");
+		  const downloadBtn = document.getElementById("download");
+		  const clearBtn = document.getElementById("clear");
+      const catchup30Btn = document.getElementById("catchup30");
+      const catchup120Btn = document.getElementById("catchup120");
+      const catchup300Btn = document.getElementById("catchup300");
+      const catchupDiv = document.getElementById("catchup");
+      const inputSourceSel = document.getElementById("input-source");
 
   const wsIndicator = document.getElementById("ws-indicator");
   const wsStatus = document.getElementById("ws-status");
   const audioIndicator = document.getElementById("audio-indicator");
-  const audioStatus = document.getElementById("audio-status");
-  const awsIndicator = document.getElementById("aws-indicator");
-  const awsStatus = document.getElementById("aws-status");
+	  const audioStatus = document.getElementById("audio-status");
+	  const awsIndicator = document.getElementById("aws-indicator");
+	  const awsStatus = document.getElementById("aws-status");
+      const translationIndicator = document.getElementById("translation-indicator");
+      const translationStatus = document.getElementById("translation-status");
+      const catchupIndicator = document.getElementById("catchup-indicator");
+      const catchupStatus = document.getElementById("catchup-status");
 
   function setStatus(msg) { statusDiv.textContent = msg || ""; }
 
-  function updateIndicator(type, status, text) {
-    let indicator, statusSpan;
-    if (type === "ws") { indicator = wsIndicator; statusSpan = wsStatus; }
-    else if (type === "audio") { indicator = audioIndicator; statusSpan = audioStatus; }
-    else if (type === "aws") { indicator = awsIndicator; statusSpan = awsStatus; }
+	  function updateIndicator(type, status, text) {
+	    let indicator, statusSpan;
+	    if (type === "ws") { indicator = wsIndicator; statusSpan = wsStatus; }
+	    else if (type === "audio") { indicator = audioIndicator; statusSpan = audioStatus; }
+	    else if (type === "aws") { indicator = awsIndicator; statusSpan = awsStatus; }
+        else if (type === "translation") { indicator = translationIndicator; statusSpan = translationStatus; }
+        else if (type === "catchup") { indicator = catchupIndicator; statusSpan = catchupStatus; }
+        else { return; }
 
-    indicator.className = "indicator-dot " + status;
-    statusSpan.textContent = text;
-  }
+	    indicator.className = "indicator-dot " + status;
+	    statusSpan.textContent = text;
+	  }
 
   function updateView() {
     const merged = finalText + (partialText ? partialText : "");
@@ -1193,6 +1651,107 @@ async def index():
         item.jaEl.textContent = item.ja || "…";
         pairsDiv.scrollTop = pairsDiv.scrollHeight;
         rebuildTranslationFromPairs();
+      }
+
+      let selectedPairId = null;
+      function highlightPair(id) {
+        if (!id) return;
+        if (selectedPairId && alignedPairs.has(selectedPairId)) {
+          alignedPairs.get(selectedPairId).row.classList.remove("selected");
+        }
+        selectedPairId = id;
+        const item = alignedPairs.get(id);
+        if (!item) return;
+        item.row.classList.add("selected");
+        try { item.row.scrollIntoView({ block: "center", behavior: "smooth" }); } catch {}
+        setTimeout(() => {
+          if (selectedPairId === id && alignedPairs.has(id)) {
+            alignedPairs.get(id).row.classList.remove("selected");
+            selectedPairId = null;
+          }
+        }, 3500);
+      }
+
+      function formatDuration(seconds) {
+        if (seconds < 60) return `${seconds}s`;
+        const m = Math.round(seconds / 60);
+        return `${m}m`;
+      }
+
+      function renderCatchup(msg) {
+        if (!catchupDiv) return;
+        catchupDiv.textContent = "";
+
+        const meta = document.createElement("div");
+        meta.className = "catchup-meta";
+        meta.textContent = `対象: 直近 ${formatDuration(msg.window_seconds || 0)}（参照IDを押すと該当箇所へジャンプ）`;
+        catchupDiv.appendChild(meta);
+
+        const ul = document.createElement("ul");
+
+        function addBullet(text, ids) {
+          const li = document.createElement("li");
+          const t = document.createElement("div");
+          t.textContent = text;
+          li.appendChild(t);
+          if (ids && ids.length) {
+            const refs = document.createElement("div");
+            refs.className = "catchup-refs";
+            for (const id of ids) {
+              const chip = document.createElement("span");
+              chip.className = "ref-chip";
+              chip.textContent = id;
+              chip.onclick = () => highlightPair(id);
+              refs.appendChild(chip);
+            }
+            li.appendChild(refs);
+          }
+          return li;
+        }
+
+        const topic = (msg.topic || "").trim();
+        ul.appendChild(addBullet(`今の話題: ${topic || "（不明）"}`, []));
+
+        const important = Array.isArray(msg.important_points) ? msg.important_points : [];
+        if (important.length) {
+          const li = document.createElement("li");
+          li.appendChild(document.createTextNode("重要点:"));
+          const sub = document.createElement("ul");
+          for (const p of important) {
+            sub.appendChild(addBullet(p.text || "", p.ids || []));
+          }
+          li.appendChild(sub);
+          ul.appendChild(li);
+        } else {
+          ul.appendChild(addBullet("重要点: （なし）", []));
+        }
+
+        const decisions = Array.isArray(msg.decisions) ? msg.decisions : [];
+        if (decisions.length) {
+          const li = document.createElement("li");
+          li.appendChild(document.createTextNode("決定事項:"));
+          const sub = document.createElement("ul");
+          for (const d of decisions) {
+            sub.appendChild(addBullet(d.text || "", d.ids || []));
+          }
+          li.appendChild(sub);
+          ul.appendChild(li);
+        } else {
+          ul.appendChild(addBullet("決定事項: （なし）", []));
+        }
+
+        const nextTopic = (msg.next_topic || "").trim();
+        ul.appendChild(addBullet(`次の話題: ${nextTopic || "（不明）"}`, []));
+
+        catchupDiv.appendChild(ul);
+      }
+
+      function requestCatchup(seconds) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        try {
+          catchupDiv.textContent = `Catch up 生成中…（直近 ${formatDuration(seconds)}）`;
+          ws.send(JSON.stringify({ type: "catchup", seconds }));
+        } catch {}
       }
 
 	  function appendFinal(text) {
@@ -1382,19 +1941,24 @@ async def index():
     console.log('[Audio] Using ScriptProcessorNode (legacy fallback)');
   }
 
-  async function start() {
-    // リングバッファをリセット
-    ringWriteIndex = 0;
-    ringReadIndex = 0;
-
-    const scheme = (location.protocol === "https:") ? "wss" : "ws";
-    ws = new WebSocket(`${scheme}://${location.host}/ws`);
-
-    ws.onopen = async () => {
-      setStatus("Connected. Capturing audio…");
-      updateIndicator("ws", "active", "Connected");
-      updateIndicator("audio", "", "Starting...");
-      updateIndicator("aws", "", "Connecting...");
+		  async function start() {
+	        stopping = false;
+		    // リングバッファをリセット
+		    ringWriteIndex = 0;
+		    ringReadIndex = 0;
+	
+	    const scheme = (location.protocol === "https:") ? "wss" : "ws";
+	    ws = new WebSocket(`${scheme}://${location.host}/ws`);
+	    const wsLocal = ws;
+	
+		    wsLocal.onopen = async () => {
+		      if (ws !== wsLocal) return;
+		      setStatus("Connected. Capturing audio…");
+		      updateIndicator("ws", "active", "Connected");
+		      updateIndicator("audio", "", "Starting...");
+		      updateIndicator("aws", "", "Connecting...");
+	          updateIndicator("translation", "", "Idle");
+	          updateIndicator("catchup", "", "Idle");
 
       // Wake Lock
       try {
@@ -1409,34 +1973,41 @@ async def index():
         console.warn('[Wake Lock] Failed:', err);
       }
 
-      // キープアライブ
-      pingInterval = setInterval(() => {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({type: "pong"}));
-        }
-      }, 25000);
-    };
-
-    ws.onclose = () => {
-      setStatus("Disconnected.");
-      updateIndicator("ws", "", "Disconnected");
-      updateIndicator("audio", "", "Idle");
-      updateIndicator("aws", "", "Idle");
-      if (pingInterval) clearInterval(pingInterval);
-    };
-
-    ws.onerror = () => {
-      setStatus("WebSocket error.");
-      updateIndicator("ws", "error", "Error");
-      if (pingInterval) clearInterval(pingInterval);
-    };
-
-	    ws.onmessage = (event) => {
-	      try {
-	        const msg = JSON.parse(event.data);
-	        if (msg.type === "final") {
-	          appendFinal(msg.text);
-	        } else if (msg.type === "speculative" || msg.type === "partial") {
+	      // キープアライブ
+	      pingInterval = setInterval(() => {
+	        if (wsLocal && wsLocal.readyState === WebSocket.OPEN) {
+	          wsLocal.send(JSON.stringify({type: "pong"}));
+	        }
+	      }, 25000);
+	    };
+	
+		    wsLocal.onclose = () => {
+		      if (ws !== wsLocal) return;
+		      setStatus("Disconnected.");
+		      updateIndicator("ws", "", "Disconnected");
+		      updateIndicator("audio", "", "Idle");
+		      updateIndicator("aws", "", "Idle");
+	          updateIndicator("translation", "", "Idle");
+	          updateIndicator("catchup", "", "Idle");
+		      if (pingInterval) clearInterval(pingInterval);
+		    };
+	
+		    wsLocal.onerror = () => {
+		      if (ws !== wsLocal) return;
+		      setStatus("WebSocket error.");
+		      updateIndicator("ws", "error", "Error");
+	          updateIndicator("translation", "", "Idle");
+	          updateIndicator("catchup", "", "Idle");
+		      if (pingInterval) clearInterval(pingInterval);
+		    };
+	
+		    wsLocal.onmessage = (event) => {
+		      if (ws !== wsLocal) return;
+		      try {
+		        const msg = JSON.parse(event.data);
+		        if (msg.type === "final") {
+		          appendFinal(msg.text);
+		        } else if (msg.type === "speculative" || msg.type === "partial") {
 	          setPartial(msg.text);
 	        } else if (msg.type === "translation") {
 	          appendTranslation(msg.text);
@@ -1444,61 +2015,118 @@ async def index():
               addAlignedPair(msg.id, msg.en);
             } else if (msg.type === "aligned_ja") {
               setAlignedJa(msg.id, msg.ja);
-	        } else if (msg.type === "translation_error") {
-	          setStatus("Translation Error: " + (msg.error || "Unknown"));
-	        } else if (msg.type === "info") {
-	          setStatus(msg.text);
-	        } else if (msg.type === "status") {
-          if (msg.status === "aws_connected") {
-            updateIndicator("aws", "active", "Connected");
-          } else if (msg.status === "aws_error") {
-            updateIndicator("aws", "error", "Error");
-            setStatus("AWS Error: " + (msg.error || "Unknown"));
-          } else if (msg.status === "audio_receiving") {
-            updateIndicator("audio", "active", "Receiving");
-          } else if (msg.status === "transcribing") {
-            updateIndicator("aws", "active", "Transcribing");
-          }
-        } else if (msg.type === "ping") {
-          ws.send(JSON.stringify({type: "pong"}));
-        } else {
-          setPartial(msg.text || "");
-        }
-      } catch (e) {
+	            } else if (msg.type === "catchup_result") {
+	              renderCatchup(msg);
+                  updateIndicator("catchup", "active", "Ready");
+	            } else if (msg.type === "catchup_error") {
+	              catchupDiv.textContent = "Catch up Error: " + (msg.error || "Unknown");
+                  updateIndicator("catchup", "error", "Error");
+		        } else if (msg.type === "translation_error") {
+		          setStatus("Translation Error: " + (msg.error || "Unknown"));
+                  updateIndicator("translation", "error", "Error");
+		        } else if (msg.type === "info") {
+		          setStatus(msg.text);
+		        } else if (msg.type === "status") {
+	          if (msg.status === "aws_connected") {
+	            updateIndicator("aws", "active", "Connected");
+	          } else if (msg.status === "aws_error") {
+	            updateIndicator("aws", "error", "Error");
+	            setStatus("AWS Error: " + (msg.error || "Unknown"));
+	          } else if (msg.status === "audio_receiving") {
+	            updateIndicator("audio", "active", "Receiving");
+	          } else if (msg.status === "transcribing") {
+	            updateIndicator("aws", "active", "Transcribing");
+              } else if (msg.status === "translation_translating") {
+                updateIndicator("translation", "active", "Translating");
+              } else if (msg.status === "translation_throttled") {
+                updateIndicator("translation", "active", "Throttled");
+              } else if (msg.status === "translation_disabled") {
+                updateIndicator("translation", "error", "Disabled");
+              } else if (msg.status === "translation_idle") {
+                updateIndicator("translation", "", "Idle");
+              } else if (msg.status === "catchup_generating") {
+                updateIndicator("catchup", "active", "Generating");
+              } else if (msg.status === "catchup_ready") {
+                updateIndicator("catchup", "active", "Ready");
+              } else if (msg.status === "catchup_throttled") {
+                updateIndicator("catchup", "active", "Throttled");
+              } else if (msg.status === "catchup_error") {
+                updateIndicator("catchup", "error", "Error");
+              } else if (msg.status === "catchup_idle") {
+                updateIndicator("catchup", "", "Idle");
+		          }
+		        } else if (msg.type === "ping") {
+		          wsLocal.send(JSON.stringify({type: "pong"}));
+		        } else {
+		          setPartial(msg.text || "");
+	        }
+	      } catch (e) {
         appendFinal(event.data);
       }
     };
 
-    const mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-    });
+        const inputSource = (inputSourceSel && inputSourceSel.value) ? inputSourceSel.value : "mic";
+        let mediaStream;
+        if (inputSource === "tab") {
+          if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+            throw new Error("Tab Audio is not supported in this browser. Use Chrome/Edge.");
+          }
+          setStatus("Select a browser tab and enable 'Share tab audio'…");
+          mediaStream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true });
+          const audioTracks = mediaStream.getAudioTracks();
+          if (!audioTracks || audioTracks.length === 0) {
+            // Common pitfall: the user shared a window/screen without tab audio.
+            mediaStream.getTracks().forEach(t => { try { t.stop(); } catch {} });
+            throw new Error("No audio track captured. In the share dialog, choose a TAB and enable 'Share tab audio'.");
+          }
+        } else {
+          mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+          });
+        }
 
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        captureStream = mediaStream;
+        // If the user stops sharing (tab audio), end the session gracefully.
+        captureStream.getTracks().forEach((t) => {
+          try { t.addEventListener("ended", () => stop()); } catch {}
+        });
 
-    // AudioWorkletを試行、失敗時はScriptProcessorにフォールバック
-    const workletSuccess = await initAudioWorklet(audioContext, mediaStream);
+	    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+	    // AudioWorkletを試行、失敗時はScriptProcessorにフォールバック
+	    const workletSuccess = await initAudioWorklet(audioContext, mediaStream);
     if (!workletSuccess) {
       initLegacyProcessor(audioContext, mediaStream);
     }
 
     updateIndicator("audio", "active", "Capturing");
 
-    startBtn.disabled = true;
-    stopBtn.disabled = false;
-    downloadBtn.disabled = false;
-    clearBtn.disabled = false;
-  }
+		    startBtn.disabled = true;
+		    stopBtn.disabled = false;
+		    downloadBtn.disabled = false;
+		    clearBtn.disabled = false;
+        catchup30Btn.disabled = false;
+        catchup120Btn.disabled = false;
+        catchup300Btn.disabled = false;
+        if (inputSourceSel) inputSourceSel.disabled = true;
+		  }
 
-  function stop() {
-    setStatus("Stopping…");
-    if (ws) { try { ws.close(); } catch {} }
-    ws = null;
+	  function stop() {
+        if (stopping) return;
+        stopping = true;
+	    setStatus("Stopping…");
+	    if (ws) { try { ws.close(); } catch {} }
+	    ws = null;
 
-    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+	    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
     if (workletNode) { try { workletNode.disconnect(); } catch {} }
     if (legacyProcessor) { try { legacyProcessor.disconnect(); } catch {} }
     if (sourceNode) { try { sourceNode.disconnect(); } catch {} }
-    if (audioContext) { try { audioContext.close(); } catch {} }
+	    if (audioContext) { try { audioContext.close(); } catch {} }
+        if (captureStream) {
+          try { captureStream.getTracks().forEach(t => t.stop()); } catch {}
+          captureStream = null;
+        }
 
     // Wake Lock解放
     if (wakeLock) {
@@ -1524,9 +2152,13 @@ async def index():
     updateIndicator("audio", "", "Idle");
     updateIndicator("aws", "", "Idle");
 
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
-  }
+	    startBtn.disabled = false;
+	    stopBtn.disabled = true;
+        catchup30Btn.disabled = true;
+        catchup120Btn.disabled = true;
+        catchup300Btn.disabled = true;
+        if (inputSourceSel) inputSourceSel.disabled = false;
+	  }
 
   function download() {
     const transcriptContent = (finalText + partialText).trim();
@@ -1557,15 +2189,23 @@ async def index():
 	    updateTranslationView();
         alignedPairs.clear();
         if (pairsDiv) pairsDiv.textContent = "…";
+        if (catchupDiv) catchupDiv.textContent = "Press a button (30s / 2m / 5m) to catch up.";
 	    if (ws && ws.readyState === WebSocket.OPEN) {
 	      try { ws.send(JSON.stringify({type: "clear"})); } catch {}
 	    }
 	  }
 
-  startBtn.onclick = () => start().catch(err => setStatus(String(err)));
-  stopBtn.onclick = () => stop();
-  downloadBtn.onclick = () => download();
-  clearBtn.onclick = () => clearAll();
+		  startBtn.onclick = () => start().catch(err => {
+		    stop();
+		    setStatus(String(err));
+		    updateIndicator("audio", "error", "Error");
+		  });
+		  stopBtn.onclick = () => stop();
+		  downloadBtn.onclick = () => download();
+		  clearBtn.onclick = () => clearAll();
+	      catchup30Btn.onclick = () => requestCatchup(30);
+	      catchup120Btn.onclick = () => requestCatchup(120);
+      catchup300Btn.onclick = () => requestCatchup(300);
 })();
 </script>
 </body>
