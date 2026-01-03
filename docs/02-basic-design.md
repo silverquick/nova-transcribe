@@ -1,9 +1,9 @@
 # 基本設計書（nova-transcribe）
 
-**対象**: `main.py`（FastAPI + WebSocket / Bedrock Nova 2 Sonic / Bedrock Claude（翻訳/Catch up））  
+**対象**: `main.py`（entrypoint） / `nova_transcribe/*`（FastAPI + WebSocket / Bedrock Nova 2 Sonic / Bedrock Claude（翻訳/Catch up））  
 **作成日**: 2026-01-03  
 **最終更新**: 2026-01-03  
-**作成/更新根拠**: 2026-01-03 時点の `main.py` 実装（Mic/Tab Audio 入力、Aligned EN ↔ JA、Catch up を含む）を読んで整理（README とは独立）
+**作成/更新根拠**: 2026-01-03 時点の `nova_transcribe/web.py` / `nova_transcribe/index.html` 実装（Mic/Tab Audio 入力、Aligned EN ↔ JA、Catch up を含む）を読んで整理（README とは独立）
 
 ---
 
@@ -49,8 +49,10 @@
   - Web Audio API で音声入力取得（`getUserMedia()` による Mic / `getDisplayMedia({audio:true, video:true})` による Tab Audio）
   - AudioWorklet（優先）/ ScriptProcessor（フォールバック）で 16kHz PCM 化し、100ms フレームで送信
   - 文字起こし表示、翻訳表示、英日ペア表示（レスポンシブ）
-- **アプリサーバ（FastAPI / `main.py`）**
-  - `/` で HTML/JS を返す（静的ファイルなし、`main.py` に埋め込み）
+- **アプリサーバ（FastAPI）**
+  - entrypoint は `main.py`（`uvicorn main:app`）
+  - 実装本体は `nova_transcribe/web.py`
+  - `/` で HTML/JS を返す（静的ファイルなし。`nova_transcribe/index.html` を `nova_transcribe/ui.py` で読み込み）
   - `/ws` で WebSocket を受け、バイナリ音声フレームと JSON 制御メッセージを扱う
   - Bedrock 双方向ストリームを開いて音声を送信し、イベントを受信してブラウザへ中継
   - 翻訳キューを別ワーカーで処理して、英日対応のイベントをブラウザへ送信
@@ -313,7 +315,7 @@ flowchart TD
 ### 9.2 備考
 
 - 翻訳 / Catch up の実行には、Bedrock の Model access と IAM 権限（`InvokeModelWithResponseStream` 等）が必要。
-- 既定値は `main.py` の `os.getenv(..., "default")` に基づく。
+- 既定値は `nova_transcribe/settings.py` の `os.getenv(..., "default")` に基づく。
 
 ---
 

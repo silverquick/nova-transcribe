@@ -184,6 +184,17 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload --env-file .env
 
 ブラウザで `http://localhost:8000` を開きます。
 
+## コード構成（分割後）
+
+- `main.py`: エントリポイント（`uvicorn main:app`）
+- `nova_transcribe/web.py`: FastAPI/WS の本体
+- `nova_transcribe/index.html`: UI（HTML/JS/CSS）
+- `nova_transcribe/ui.py`: UI ローダー
+- `nova_transcribe/bedrock.py`: Bedrock/Nova/Claude の接続
+- `nova_transcribe/parsing.py`: パース系ユーティリティ
+- `nova_transcribe/settings.py`: 環境変数・既定値
+- `nova_transcribe/logging_setup.py`: ログ初期化
+
 ### プロキシ経由での実行（Cloudflare Access など）
 
 リバースプロキシやCloudflare Access経由で公開する場合、以下のオプションを追加：
