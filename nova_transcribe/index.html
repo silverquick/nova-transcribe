@@ -260,6 +260,7 @@
     </div>
   </div>
 
+  <h3>English Transcript</h3>
   <div id="transcript">Press "Start" and speak.</div>
   <h3>Japanese Translation</h3>
   <div id="translation">…</div>
@@ -353,12 +354,12 @@
 
   function updateView() {
     const merged = finalText + (partialText ? (finalText ? "\n" : "") + partialText : "");
-    transcriptDiv.textContent = merged || "…";
+    transcriptDiv.textContent = normalizeText(merged) || "…";
     transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
   }
 
 	  function updateTranslationView() {
-	    translationDiv.textContent = finalTranslation || "…";
+	    translationDiv.textContent = normalizeText(finalTranslation) || "…";
 	    translationDiv.scrollTop = translationDiv.scrollHeight;
 	  }
 
@@ -375,7 +376,7 @@
         for (const item of alignedPairs.values()) {
           if (item.ja) lines.push(normalizeText(item.ja));
         }
-        finalTranslation = lines.join("\\n");
+        finalTranslation = lines.join("\n");
         partialTranslation = "";
         updateTranslationView();
       }
@@ -664,7 +665,7 @@
 	  function appendFinal(text) {
         const normalized = normalizeText(text).trim();
         if (!normalized) return;
-        if (finalText) finalText += "\\n";
+        if (finalText) finalText += "\n";
 	    finalText += normalized;
 	    partialText = "";
     updateView();

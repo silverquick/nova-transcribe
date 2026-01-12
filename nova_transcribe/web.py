@@ -3,6 +3,7 @@ from collections import deque
 import json
 import logging
 import os
+import re
 import time
 from typing import Optional
 
@@ -652,6 +653,22 @@ async def ws_endpoint(websocket: WebSocket):
     async def meeting_assist_worker():
         nonlocal meeting_assist_count, meeting_assist_model_id_in_use, conversation_epoch, meeting_assist_enabled
         logger.info("meeting_assist_worker task started, waiting for meeting assist requests...")
+        def _parse_json_maybe(text: str) -> Optional[dict]:
+            if not text:
+                return None
+            json_part = _extract_first_json_object(text)
+            if not json_part:
+                return None
+            try:
+                return json.loads(json_part)
+            except json.JSONDecodeError:
+                # 軽い修正: 末尾の余分なカンマを除去して再試行
+                cleaned = re.sub(r",\s*([}\]])", r"\1", json_part)
+                try:
+                    return json.loads(cleaned)
+                except json.JSONDecodeError:
+                    return None
+
         while not stop_event.is_set():
             try:
                 req = await meeting_assist_q.get()
@@ -769,8 +786,38 @@ async def ws_endpoint(websocket: WebSocket):
                 if batch_epoch != conversation_epoch or not buf.strip() or not meeting_assist_enabled:
                     continue
 
-                json_part = _extract_first_json_object(buf)
-                parsed = json.loads(json_part) if json_part else None
+                parsed = _parse_json_maybe(buf)
+                if not isinstance(parsed, dict):
+                    # 1回だけ再試行：モデル出力を修復させる
+                    fix_prompt = (
+                        "You will be given a response that should be JSON but is invalid.\n"
+                        "Repair it into valid JSON only (no markdown), parsable by json.loads.\n"
+                        "Use double quotes for all keys/strings. No trailing commas.\n"
+                        "If a field is missing, use empty string or empty array.\n\n"
+                        "Schema:\n"
+                        "{\n"
+                        '  "topic": string,\n'
+                        '  "participants": [{"name": string, "role": string, "notes": string}],\n'
+                        '  "direction": string,\n'
+                        '  "options": [{"text": string}],\n'
+                        '  "english_advice": [{"ja": string, "en": string}]\n'
+                        "}\n\n"
+                        "Invalid output:\n"
+                        f"{buf}\n"
+                    )
+                    buf_retry = ""
+                    async for delta in stream_prompt_text_deltas(
+                        client,
+                        prompt=fix_prompt,
+                        model_id=meeting_assist_model_id_in_use,
+                        max_tokens=MEETING_ASSIST_MAX_TOKENS,
+                    ):
+                        if batch_epoch != conversation_epoch:
+                            buf_retry = ""
+                            break
+                        buf_retry += delta
+                    parsed = _parse_json_maybe(buf_retry)
+
                 if not isinstance(parsed, dict):
                     raise ValueError("Invalid JSON from model")
 
