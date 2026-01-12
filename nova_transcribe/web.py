@@ -33,6 +33,12 @@ from .settings import (
     CATCHUP_MODEL_ID,
     CATCHUP_MODEL_ID_FALLBACK,
     KEEPALIVE_SECONDS,
+    MEETING_ASSIST_MAX_INPUT_CHARS,
+    MEETING_ASSIST_MAX_TOKENS,
+    MEETING_ASSIST_MIN_INTERVAL_SECONDS,
+    MEETING_ASSIST_MODEL_ID,
+    MEETING_ASSIST_MODEL_ID_FALLBACK,
+    MEETING_ASSIST_WINDOW_SECONDS,
     MODEL_ID,
     RENEW_SECONDS,
     TRANSLATION_DEBOUNCE_SECONDS,
@@ -62,6 +68,7 @@ async def ws_endpoint(websocket: WebSocket):
     audio_q: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=20)
     translation_q: asyncio.Queue[dict] = asyncio.Queue(maxsize=50)
     catchup_q: asyncio.Queue[dict] = asyncio.Queue(maxsize=1)
+    meeting_assist_q: asyncio.Queue[dict] = asyncio.Queue(maxsize=1)
 
     # シンプルなプロンプトで低遅延化
     system_prompt = "Transcribe the user's speech into text accurately."
@@ -110,6 +117,13 @@ async def ws_endpoint(websocket: WebSocket):
     catchup_model_id_in_use = CATCHUP_MODEL_ID
     catchup_model_id_fallback = CATCHUP_MODEL_ID_FALLBACK
 
+    meeting_assist_enabled = False
+    meeting_assist_count = 0
+    meeting_assist_model_id_in_use = MEETING_ASSIST_MODEL_ID
+    meeting_assist_model_id_fallback = MEETING_ASSIST_MODEL_ID_FALLBACK
+    meeting_assist_last_request_at = 0.0
+    meeting_assist_last_seq_scheduled = 0
+
     logger.info(
         "Translation model configured: "
         f"primary='{translation_model_id_in_use}', fallback='{translation_model_id_fallback}'"
@@ -117,6 +131,10 @@ async def ws_endpoint(websocket: WebSocket):
     logger.info(
         "Catch-up model configured: "
         f"primary='{catchup_model_id_in_use}', fallback='{catchup_model_id_fallback}'"
+    )
+    logger.info(
+        "Meeting assist model configured: "
+        f"primary='{meeting_assist_model_id_in_use}', fallback='{meeting_assist_model_id_fallback}'"
     )
 
     def _prune_utterance_log(now_ts: float) -> None:
@@ -135,6 +153,28 @@ async def ws_endpoint(websocket: WebSocket):
                 utterance_by_id.pop(old.get("id"), None)
             except Exception:
                 pass
+
+    def _schedule_meeting_assist(force: bool = False) -> None:
+        nonlocal meeting_assist_last_request_at, meeting_assist_last_seq_scheduled
+        if not meeting_assist_enabled:
+            return
+        if not force and not utterance_log:
+            return
+        if meeting_assist_q.full():
+            return
+        now_mono = time.monotonic()
+        if not force:
+            if translation_segment_seq == meeting_assist_last_seq_scheduled:
+                return
+            if (now_mono - meeting_assist_last_request_at) < MEETING_ASSIST_MIN_INTERVAL_SECONDS:
+                return
+        meeting_assist_last_request_at = now_mono
+        meeting_assist_last_seq_scheduled = translation_segment_seq
+        req = {"epoch": conversation_epoch, "window_seconds": MEETING_ASSIST_WINDOW_SECONDS}
+        try:
+            meeting_assist_q.put_nowait(req)
+        except asyncio.QueueFull:
+            pass
 
     async def translation_worker():
         nonlocal translation_count, translation_model_id_in_use, translation_enabled, translation_disabled_reason, conversation_epoch
@@ -609,6 +649,278 @@ async def ws_endpoint(websocket: WebSocket):
 
         logger.info("catchup_worker task ended.")
 
+    async def meeting_assist_worker():
+        nonlocal meeting_assist_count, meeting_assist_model_id_in_use, conversation_epoch, meeting_assist_enabled
+        logger.info("meeting_assist_worker task started, waiting for meeting assist requests...")
+        while not stop_event.is_set():
+            try:
+                req = await meeting_assist_q.get()
+            except asyncio.CancelledError:
+                break
+
+            if stop_event.is_set():
+                break
+            if not meeting_assist_enabled:
+                continue
+            if req.get("epoch") != conversation_epoch:
+                continue
+
+            window_seconds = int(req.get("window_seconds") or MEETING_ASSIST_WINDOW_SECONDS)
+            window_seconds = max(30, min(window_seconds, CATCHUP_LOG_MAX_SECONDS))
+            batch_epoch = req.get("epoch")
+
+            if not await safe_send({"type": "status", "status": "meeting_assist_generating"}):
+                return
+
+            now_ts = time.time()
+            cutoff = now_ts - window_seconds
+            _prune_utterance_log(now_ts)
+
+            window_items = [u for u in utterance_log if float(u.get("ts", 0)) >= cutoff]
+            if not window_items:
+                msg = {
+                    "type": "meeting_assist_result",
+                    "window_seconds": window_seconds,
+                    "topic": "",
+                    "participants": [],
+                    "direction": "",
+                    "options": [],
+                    "english_advice": [],
+                }
+                if meeting_assist_enabled and batch_epoch == conversation_epoch:
+                    if not await safe_send(msg):
+                        return
+                    await safe_send({"type": "status", "status": "meeting_assist_ready"})
+                continue
+
+            # 入力が長すぎる場合は末尾（最新）から詰める
+            chosen: list[dict] = []
+            total_chars = 0
+            for u in reversed(window_items):
+                en = (u.get("en") or "").strip()
+                ja = (u.get("ja") or "").strip()
+                block = f"{u.get('id')}\nEN: {en}\n"
+                if ja:
+                    block += f"JA: {ja}\n"
+                block += "\n"
+                if total_chars + len(block) > MEETING_ASSIST_MAX_INPUT_CHARS and chosen:
+                    break
+                chosen.append(u)
+                total_chars += len(block)
+            chosen.reverse()
+
+            transcript_blocks = []
+            for u in chosen:
+                seg_id = u.get("id")
+                en = (u.get("en") or "").strip()
+                ja = (u.get("ja") or "").strip()
+                if not seg_id or not en:
+                    continue
+                transcript_blocks.append(f"{seg_id}\nEN: {en}")
+                if ja:
+                    transcript_blocks.append(f"JA: {ja}")
+                transcript_blocks.append("")
+            transcript_text = "\n".join(transcript_blocks).strip()
+
+            meeting_assist_count += 1
+            logger.info(
+                "Meeting assist request #"
+                f"{meeting_assist_count}: window={window_seconds}s, segments={len(chosen)}, chars={len(transcript_text)}"
+            )
+
+            prompt = (
+                "You are a real-time meeting navigator assistant.\n"
+                "A participant wants to understand the meeting status and how to respond.\n\n"
+                "You will receive transcript segments with IDs like u12.\n"
+                "Each segment may have EN and sometimes JA.\n"
+                "Use JA when available; otherwise use EN.\n\n"
+                "Return ONLY valid JSON (no markdown), with this schema:\n"
+                "{\n"
+                '  "topic": string,\n'
+                '  "participants": [{"name": string, "role": string, "notes": string}],\n'
+                '  "direction": string,\n'
+                '  "options": [{"text": string}],\n'
+                '  "english_advice": [{"ja": string, "en": string}]\n'
+                "}\n\n"
+                "Rules:\n"
+                "- All strings must be Japanese except english_advice[].en (English).\n"
+                "- Participants are inferred from the transcript; if unsure, keep fields empty or note '推定'.\n"
+                "- If there are no options or advice, return empty arrays.\n"
+                "- Keep it concise and practical for a live meeting.\n"
+                "- Do not invent facts not present in the transcript.\n\n"
+                f"Time window: last {window_seconds} seconds.\n\n"
+                "Transcript:\n"
+                f"{transcript_text}\n"
+            )
+
+            try:
+                buf = ""
+                async for delta in stream_prompt_text_deltas(
+                    client,
+                    prompt=prompt,
+                    model_id=meeting_assist_model_id_in_use,
+                    max_tokens=MEETING_ASSIST_MAX_TOKENS,
+                ):
+                    if batch_epoch != conversation_epoch:
+                        buf = ""
+                        break
+                    buf += delta
+
+                if batch_epoch != conversation_epoch or not buf.strip() or not meeting_assist_enabled:
+                    continue
+
+                json_part = _extract_first_json_object(buf)
+                parsed = json.loads(json_part) if json_part else None
+                if not isinstance(parsed, dict):
+                    raise ValueError("Invalid JSON from model")
+
+                topic = str(parsed.get("topic") or "").strip()
+                direction = str(parsed.get("direction") or "").strip()
+
+                def _norm_participants(items):
+                    out = []
+                    if not isinstance(items, list):
+                        return out
+                    for it in items:
+                        if isinstance(it, str):
+                            text = it.strip()
+                            if text:
+                                out.append({"name": text, "role": "", "notes": ""})
+                            continue
+                        if not isinstance(it, dict):
+                            continue
+                        name = str(it.get("name") or "").strip()
+                        role = str(it.get("role") or "").strip()
+                        notes = str(it.get("notes") or "").strip()
+                        if name or role or notes:
+                            out.append({"name": name, "role": role, "notes": notes})
+                    return out[:8]
+
+                def _norm_options(items):
+                    out = []
+                    if not isinstance(items, list):
+                        return out
+                    for it in items:
+                        if isinstance(it, str):
+                            text = it.strip()
+                            if text:
+                                out.append({"text": text})
+                            continue
+                        if not isinstance(it, dict):
+                            continue
+                        text = str(
+                            it.get("text")
+                            or it.get("option")
+                            or it.get("summary")
+                            or ""
+                        ).strip()
+                        if text:
+                            out.append({"text": text})
+                    return out[:6]
+
+                def _norm_advice(items):
+                    out = []
+                    if not isinstance(items, list):
+                        return out
+                    for it in items:
+                        if isinstance(it, str):
+                            text = it.strip()
+                            if text:
+                                out.append({"ja": text, "en": ""})
+                            continue
+                        if not isinstance(it, dict):
+                            continue
+                        ja = str(it.get("ja") or it.get("intent") or it.get("note") or "").strip()
+                        en = str(
+                            it.get("en") or it.get("phrase") or it.get("say") or ""
+                        ).strip()
+                        if ja or en:
+                            out.append({"ja": ja, "en": en})
+                    return out[:6]
+
+                msg = {
+                    "type": "meeting_assist_result",
+                    "window_seconds": window_seconds,
+                    "topic": topic,
+                    "participants": _norm_participants(parsed.get("participants") or []),
+                    "direction": direction,
+                    "options": _norm_options(parsed.get("options") or []),
+                    "english_advice": _norm_advice(parsed.get("english_advice") or []),
+                }
+                if not meeting_assist_enabled or batch_epoch != conversation_epoch:
+                    continue
+                if not await safe_send(msg):
+                    return
+                await safe_send({"type": "status", "status": "meeting_assist_ready"})
+
+            except ValidationException as e:
+                message_raw = getattr(e, "message", None) or str(e) or ""
+                message = message_raw.lower()
+                if "model identifier is invalid" in message:
+                    meeting_assist_enabled = False
+                    try:
+                        while True:
+                            meeting_assist_q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                    await safe_send(
+                        {
+                            "type": "meeting_assist_error",
+                            "error": (
+                                "Meeting Assist のモデルIDが無効です。"
+                                " `.env` の MEETING_ASSIST_MODEL_ID を有効なID/ARNに設定してください。"
+                            ),
+                        }
+                    )
+                    await safe_send({"type": "status", "status": "meeting_assist_idle"})
+                    continue
+                if (
+                    "on-demand throughput" in message
+                    and "inference profile" in message
+                    and meeting_assist_model_id_in_use != meeting_assist_model_id_fallback
+                ):
+                    logger.warning(
+                        "Meeting assist model does not support on-demand throughput. "
+                        f"Switching to inference profile: {meeting_assist_model_id_fallback}"
+                    )
+                    meeting_assist_model_id_in_use = meeting_assist_model_id_fallback
+                    try:
+                        await websocket.send_text(
+                            json.dumps(
+                                {
+                                    "type": "info",
+                                    "text": (
+                                        "Meeting Assist モデルを inference profile に切り替えました: "
+                                        f"model_id={meeting_assist_model_id_in_use}"
+                                    ),
+                                }
+                            )
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+                logger.error(f"Meeting assist error: {e}", exc_info=True)
+                await safe_send({"type": "status", "status": "meeting_assist_error"})
+                await safe_send({"type": "meeting_assist_error", "error": str(e)})
+
+            except ThrottlingException as e:
+                logger.warning(f"Meeting assist throttled: {e}")
+                await safe_send({"type": "status", "status": "meeting_assist_throttled"})
+                await safe_send(
+                    {
+                        "type": "meeting_assist_error",
+                        "error": "混雑しています。少し待ってから再試行してください。",
+                    }
+                )
+
+            except Exception as e:
+                logger.error(f"Meeting assist error: {e}", exc_info=True)
+                await safe_send({"type": "status", "status": "meeting_assist_error"})
+                await safe_send({"type": "meeting_assist_error", "error": str(e)})
+
+        logger.info("meeting_assist_worker task ended.")
+
     async def start_session():
         nonlocal session, output_task
         try:
@@ -705,6 +1017,7 @@ async def ws_endpoint(websocket: WebSocket):
                                     json.dumps({"type": "aligned_en", "id": seg_id, "en": text})
                                 )
                                 translation_q.put_nowait({"epoch": conversation_epoch, "id": seg_id, "en": text})
+                                _schedule_meeting_assist()
                             except asyncio.QueueFull:
                                 # キューが満杯の場合、古いリクエストを破棄して新しい翻訳を優先（リアルタイム性優先）
                                 try:
@@ -729,6 +1042,7 @@ async def ws_endpoint(websocket: WebSocket):
                                         json.dumps({"type": "aligned_en", "id": seg_id, "en": text})
                                     )
                                     translation_q.put_nowait({"epoch": conversation_epoch, "id": seg_id, "en": text})
+                                    _schedule_meeting_assist()
                                     logger.warning(
                                         "Translation queue full, dropped oldest translation request to insert new one"
                                     )
@@ -802,6 +1116,7 @@ async def ws_endpoint(websocket: WebSocket):
 
     async def recv_from_browser():
         nonlocal audio_frame_count, last_audio_time, translation_started, translation_segment_seq, conversation_epoch
+        nonlocal meeting_assist_enabled, meeting_assist_last_request_at, meeting_assist_last_seq_scheduled
         try:
             while not stop_event.is_set():
                 message = await websocket.receive()
@@ -818,11 +1133,21 @@ async def ws_endpoint(websocket: WebSocket):
                             translation_started = False
                             conversation_epoch += 1
                             translation_segment_seq = 0
+                            meeting_assist_last_request_at = 0.0
+                            meeting_assist_last_seq_scheduled = 0
                             utterance_log.clear()
                             utterance_by_id.clear()
                             try:
                                 await websocket.send_text(json.dumps({"type": "status", "status": "translation_idle"}))
                                 await websocket.send_text(json.dumps({"type": "status", "status": "catchup_idle"}))
+                                if meeting_assist_enabled:
+                                    await websocket.send_text(
+                                        json.dumps({"type": "status", "status": "meeting_assist_enabled"})
+                                    )
+                                else:
+                                    await websocket.send_text(
+                                        json.dumps({"type": "status", "status": "meeting_assist_idle"})
+                                    )
                             except Exception:
                                 break
                             try:
@@ -833,6 +1158,11 @@ async def ws_endpoint(websocket: WebSocket):
                             try:
                                 while True:
                                     catchup_q.get_nowait()
+                            except asyncio.QueueEmpty:
+                                pass
+                            try:
+                                while True:
+                                    meeting_assist_q.get_nowait()
                             except asyncio.QueueEmpty:
                                 pass
                         elif msg.get("type") == "catchup":
@@ -850,6 +1180,21 @@ async def ws_endpoint(websocket: WebSocket):
                                     catchup_q.put_nowait(req)
                                 except asyncio.QueueFull:
                                     pass
+                        elif msg.get("type") == "meeting_assist_toggle":
+                            enabled = bool(msg.get("enabled"))
+                            meeting_assist_enabled = enabled
+                            meeting_assist_last_request_at = 0.0
+                            meeting_assist_last_seq_scheduled = 0
+                            if not enabled:
+                                try:
+                                    while True:
+                                        meeting_assist_q.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    pass
+                                await safe_send({"type": "status", "status": "meeting_assist_idle"})
+                            else:
+                                await safe_send({"type": "status", "status": "meeting_assist_enabled"})
+                                _schedule_meeting_assist(force=True)
                     except json.JSONDecodeError:
                         logger.warning(f"Invalid JSON received: {message['text'][:100]}")
 
@@ -924,6 +1269,7 @@ async def ws_endpoint(websocket: WebSocket):
         asyncio.create_task(send_to_bedrock()),
         asyncio.create_task(translation_worker()),
         asyncio.create_task(catchup_worker()),
+        asyncio.create_task(meeting_assist_worker()),
     ]
 
     try:

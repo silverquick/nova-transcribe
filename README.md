@@ -9,6 +9,7 @@ Amazon Bedrock の Nova 2 Sonic を使ったブラウザ音声（Mic / Tab Audio
 - Bedrock の Claude 4.5 Haiku で英日翻訳（**final のみ** / ストリーミング）
 - 英語（USER final）と日本語を **1発話ごとに紐づけて表示**（Aligned EN ↔ JA）
 - 会議の「追いつき」補助: **Catch up**（30秒 / 2分 / 5分の範囲を日本語で箇条書き要約。参照IDから該当発話へジャンプ）
+- 会議の状況把握補助: **Meeting Assist**（話題/会話者/方向性/選択肢/英語での発言例を自動整理。スイッチでON/OFF）
 - リアルタイム表示とTXTファイル保存機能
 - 8分のストリーム寿命制限を自動更新で回避
 - **画面スリープ防止機能**（モバイル対応 - Wake Lock API）
@@ -21,7 +22,7 @@ Amazon Bedrock の Nova 2 Sonic を使ったブラウザ音声（Mic / Tab Audio
 - **uv** パッケージマネージャー
 - AWS アカウントと以下の設定：
   - Amazon Bedrock で **Nova 2 Sonic** の Model access が有効（必須）
-  - 翻訳 / Catch up を使う場合は **Claude 4.5 Haiku** の Model access も有効
+- 翻訳 / Catch up / Meeting Assist を使う場合は **Claude 4.5 Haiku** の Model access も有効
   - 適切な IAM 権限（`bedrock:InvokeModelWithBidirectionalStream` / `bedrock:InvokeModelWithResponseStream` など）
   - 利用リージョン: `ap-northeast-1`（Tokyo）推奨
 
@@ -32,7 +33,7 @@ Amazon Bedrock の Nova 2 Sonic を使ったブラウザ音声（Mic / Tab Audio
 1. AWS コンソール → Amazon Bedrock
 2. **Model access** で以下を "Access granted" にする
    - **Amazon Nova 2 Sonic**（必須）
-   - **Anthropic Claude 4.5 Haiku**（翻訳 / Catch up を使う場合）
+  - **Anthropic Claude 4.5 Haiku**（翻訳 / Catch up / Meeting Assist を使う場合）
 3. Anthropic 系モデルは、初回利用前に **use case details**（利用目的の申請）提出が必要な場合があります  
    エラーに `Model use case details have not been submitted` と出たら、フォームを提出して **15分ほど待ってから**再試行してください
 
@@ -130,6 +131,16 @@ AWS_REGION=ap-northeast-1
 # CATCHUP_LOG_MAX_SECONDS=1800
 # CATCHUP_MAX_INPUT_CHARS=6000
 
+# Meeting Assist（会議状況ガイド・任意）
+# MEETING_ASSIST_MODEL_ID の既定: TRANSLATION_MODEL_ID と同じ
+# MEETING_ASSIST_MODEL_ID=anthropic.claude-haiku-4-5-20251001-v1:0
+# MEETING_ASSIST_MODEL_ID_FALLBACK の既定: TRANSLATION_MODEL_ID_FALLBACK と同じ
+# MEETING_ASSIST_MODEL_ID_FALLBACK=us.anthropic.claude-haiku-4-5-20251001-v1:0
+# MEETING_ASSIST_MAX_TOKENS=450
+# MEETING_ASSIST_MIN_INTERVAL_SECONDS=45
+# MEETING_ASSIST_WINDOW_SECONDS=600
+# MEETING_ASSIST_MAX_INPUT_CHARS=8000
+
 # デバッグログを有効にする場合（オプション）
 # LOG_LEVEL=DEBUG
 ```
@@ -156,9 +167,15 @@ AWS_REGION=ap-northeast-1
 | Catch up | `CATCHUP_LOG_MAX_ITEMS` | 任意 | `200` | 会話ログ保持の最大発話数 |
 | Catch up | `CATCHUP_LOG_MAX_SECONDS` | 任意 | `1800` | 会話ログ保持の最大秒数（30分） |
 | Catch up | `CATCHUP_MAX_INPUT_CHARS` | 任意 | `6000` | Catch up に渡す最大文字数（概算） |
+| Meeting Assist | `MEETING_ASSIST_MODEL_ID` | 任意 | `TRANSLATION_MODEL_ID` | Meeting Assist のモデルID |
+| Meeting Assist | `MEETING_ASSIST_MODEL_ID_FALLBACK` | 任意 | `TRANSLATION_MODEL_ID_FALLBACK` | on-demand 不可時のフォールバック |
+| Meeting Assist | `MEETING_ASSIST_MAX_TOKENS` | 任意 | `450` | Meeting Assist の最大出力トークン |
+| Meeting Assist | `MEETING_ASSIST_MIN_INTERVAL_SECONDS` | 任意 | `45` | Meeting Assist の最小更新間隔（秒） |
+| Meeting Assist | `MEETING_ASSIST_WINDOW_SECONDS` | 任意 | `600` | 解析対象の時間窓（秒） |
+| Meeting Assist | `MEETING_ASSIST_MAX_INPUT_CHARS` | 任意 | `8000` | Meeting Assist に渡す最大文字数（概算） |
 
 **注意**:
-- 翻訳 / Catch up を使う場合、IAM と Bedrock の Model access（Anthropic を含む）が必要です。
+- 翻訳 / Catch up / Meeting Assist を使う場合、IAM と Bedrock の Model access（Anthropic を含む）が必要です。
 
 **重要**: `.env` ファイルは `.gitignore` に含まれています。Git にコミットしないでください。
 
@@ -225,12 +242,13 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000 --proxy-headers --env-file .e
 
 #### 4. 動作状態の可視化
 
-- ブラウザUIに5つのステータスインジケーターを表示（操作バーはスクロールしても上部に追従）：
+- ブラウザUIに6つのステータスインジケーターを表示（操作バーはスクロールしても上部に追従）：
   - **WebSocket**: 接続状態（緑 = 接続中、赤 = エラー）
   - **Audio**: 音声（Mic/Tab Audio）の受信状態
   - **AWS**: Bedrock との通信状態
   - **Translation**: 翻訳の状態（Translating/Throttled/Disabled など）
   - **Catch up**: 追いつき機能の状態（Generating/Ready/Throttled など）
+  - **Meeting Assist**: 会議状況ガイドの状態（On/Generating/Ready/Throttled など）
 - サーバー側ログでも詳細な状態を確認可能
 
 ### 高パフォーマンス実行（本番環境向け）
@@ -273,9 +291,10 @@ uv add uvloop httptools websockets
 6. **final（確定）** テキスト（USERロール）のみ、日本語翻訳が下部にストリーミング表示されます
 7. **Aligned EN ↔ JA** で、英語（発話）と日本語（翻訳）が行単位で対応表示されます（スマホ幅では自動的に縦積み）
 8. **Catch up**（30s / 2m / 5m）で、直近の会話に日本語の箇条書きで追いつけます（参照IDを押すと該当行へジャンプ）
-9. **Download TXT** で英語文字起こし + 日本語翻訳をテキストファイルとして保存
-10. **Clear** で文字起こし/翻訳/会話ログ/追いつき結果をクリア
-11. **Stop** で録音を停止（`Tab Audio` は共有停止でも自動停止します）
+9. **Meeting Assist** スイッチを ON にすると、会議の話題/会話者/方向性/選択肢/英語での発言例が自動更新されます
+10. **Download TXT** で英語文字起こし + 日本語翻訳をテキストファイルとして保存
+11. **Clear** で文字起こし/翻訳/会話ログ/追いつき結果をクリア
+12. **Stop** で録音を停止（`Tab Audio` は共有停止でも自動停止します）
 
 ### セッション自動更新
 
@@ -448,6 +467,12 @@ Bedrock のストリーム寿命（8分）を回避するため、7分45秒ご�
 
 - **Catch up**:
   - Idle: 待機中
+  - Generating: 生成中
+  - Ready: 結果表示可能
+  - Throttled / Error: 混雑またはエラー
+
+- **Meeting Assist**:
+  - Off / On: 無効 / 有効
   - Generating: 生成中
   - Ready: 結果表示可能
   - Throttled / Error: 混雑またはエラー

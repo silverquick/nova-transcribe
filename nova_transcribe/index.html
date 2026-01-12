@@ -25,6 +25,40 @@
     h1 { margin: 0 0 6px 0; font-size: 20px; color: var(--text); }
     .sub { color: var(--muted); margin-bottom: 14px; }
     .controls { display: flex; gap: 10px; flex-wrap: wrap; margin: 14px 0; align-items: center; }
+    .toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      user-select: none;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .toggle input { position: absolute; opacity: 0; width: 0; height: 0; }
+    .toggle-slider {
+      width: 36px;
+      height: 20px;
+      border-radius: 999px;
+      background: #374151;
+      border: 1px solid var(--btn-border);
+      position: relative;
+      transition: background 0.2s ease;
+      box-shadow: inset 0 0 0 1px rgba(0,0,0,0.15);
+    }
+    .toggle-slider::after {
+      content: "";
+      width: 14px;
+      height: 14px;
+      border-radius: 999px;
+      background: #e5e7eb;
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      transition: transform 0.2s ease;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.4);
+    }
+    .toggle input:checked + .toggle-slider { background: #22c55e; }
+    .toggle input:checked + .toggle-slider::after { transform: translateX(16px); }
     button {
       padding: 10px 14px;
       font-size: 14px;
@@ -136,6 +170,26 @@
     #catchup ul { margin: 8px 0 0 0; padding-left: 18px; }
     .catchup-meta { color: var(--muted); font-size: 12px; }
     .catchup-refs { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+    #meeting-assist {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      padding: 14px;
+      border-radius: 10px;
+      margin-top: 12px;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    #meeting-assist ul { margin: 8px 0 0 0; padding-left: 18px; }
+    .assist-meta { color: var(--muted); font-size: 12px; }
+    .assist-phrase {
+      margin-top: 4px;
+      padding: 6px 8px;
+      border-radius: 8px;
+      background: rgba(34,197,94,0.12);
+      color: #a7f3d0;
+      font-size: 13px;
+      border: 1px solid rgba(34,197,94,0.25);
+    }
     .ref-chip {
       font-size: 12px;
       padding: 2px 8px;
@@ -170,6 +224,11 @@
       <button id="catchup30" disabled>30s</button>
       <button id="catchup120" disabled>2m</button>
       <button id="catchup300" disabled>5m</button>
+      <span style="margin-left: 8px; font-size: 12px; color: var(--muted);">Meeting Assist:</span>
+      <label class="toggle">
+        <input type="checkbox" id="meeting-assist-toggle" aria-label="Meeting Assist" />
+        <span class="toggle-slider"></span>
+      </label>
       <div id="status"></div>
     </div>
 
@@ -194,6 +253,10 @@
         <div class="indicator-dot" id="catchup-indicator"></div>
         <span>Catch up: <span id="catchup-status">Idle</span></span>
       </div>
+      <div class="indicator">
+        <div class="indicator-dot" id="meeting-assist-indicator"></div>
+        <span>Meeting Assist: <span id="meeting-assist-status">Off</span></span>
+      </div>
     </div>
   </div>
 
@@ -204,6 +267,8 @@
   <div id="pairs">…</div>
   <h3>Catch up</h3>
   <div id="catchup">Press a button (30s / 2m / 5m) to catch up.</div>
+  <h3>Meeting Assist</h3>
+  <div id="meeting-assist">Turn on the switch to get live meeting guidance.</div>
   <div class="hint">
     If you deploy behind HTTPS, this page will automatically use <code>wss://</code>. Microphone access requires a secure context (HTTPS or localhost).
     <br>Status indicators show connection health in real-time.
@@ -253,6 +318,8 @@
       const catchup120Btn = document.getElementById("catchup120");
       const catchup300Btn = document.getElementById("catchup300");
       const catchupDiv = document.getElementById("catchup");
+      const meetingAssistToggle = document.getElementById("meeting-assist-toggle");
+      const meetingAssistDiv = document.getElementById("meeting-assist");
       const inputSourceSel = document.getElementById("input-source");
 
   const wsIndicator = document.getElementById("ws-indicator");
@@ -265,16 +332,19 @@
       const translationStatus = document.getElementById("translation-status");
       const catchupIndicator = document.getElementById("catchup-indicator");
       const catchupStatus = document.getElementById("catchup-status");
+      const meetingAssistIndicator = document.getElementById("meeting-assist-indicator");
+      const meetingAssistStatus = document.getElementById("meeting-assist-status");
 
   function setStatus(msg) { statusDiv.textContent = msg || ""; }
 
-	  function updateIndicator(type, status, text) {
+  function updateIndicator(type, status, text) {
 	    let indicator, statusSpan;
 	    if (type === "ws") { indicator = wsIndicator; statusSpan = wsStatus; }
 	    else if (type === "audio") { indicator = audioIndicator; statusSpan = audioStatus; }
 	    else if (type === "aws") { indicator = awsIndicator; statusSpan = awsStatus; }
         else if (type === "translation") { indicator = translationIndicator; statusSpan = translationStatus; }
         else if (type === "catchup") { indicator = catchupIndicator; statusSpan = catchupStatus; }
+        else if (type === "meeting_assist") { indicator = meetingAssistIndicator; statusSpan = meetingAssistStatus; }
         else { return; }
 
 	    indicator.className = "indicator-dot " + status;
@@ -282,7 +352,7 @@
 	  }
 
   function updateView() {
-    const merged = finalText + (partialText ? partialText : "");
+    const merged = finalText + (partialText ? (finalText ? "\n" : "") + partialText : "");
     transcriptDiv.textContent = merged || "…";
     transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
   }
@@ -292,10 +362,18 @@
 	    translationDiv.scrollTop = translationDiv.scrollHeight;
 	  }
 
+      function normalizeText(text) {
+        if (!text) return "";
+        return text
+          .replace(/\\r\\n/g, "\n")
+          .replace(/\\n/g, "\n")
+          .replace(/\\t/g, "\t");
+      }
+
       function rebuildTranslationFromPairs() {
         const lines = [];
         for (const item of alignedPairs.values()) {
-          if (item.ja) lines.push(item.ja);
+          if (item.ja) lines.push(normalizeText(item.ja));
         }
         finalTranslation = lines.join("\\n");
         partialTranslation = "";
@@ -314,7 +392,8 @@
         const enEl = document.createElement("div");
         enEl.className = "pair-col pair-en";
         enEl.dataset.label = "EN";
-        enEl.textContent = en || "";
+        const enText = normalizeText(en || "");
+        enEl.textContent = enText;
 
         const jaEl = document.createElement("div");
         jaEl.className = "pair-col pair-ja";
@@ -325,7 +404,7 @@
         row.appendChild(jaEl);
         pairsDiv.appendChild(row);
 
-        alignedPairs.set(id, { en: en || "", ja: "", row, enEl, jaEl });
+        alignedPairs.set(id, { en: enText, ja: "", row, enEl, jaEl });
         pairsDiv.scrollTop = pairsDiv.scrollHeight;
       }
 
@@ -333,7 +412,7 @@
         if (!id) return;
         if (!alignedPairs.has(id)) addAlignedPair(id, "");
         const item = alignedPairs.get(id);
-        item.ja = ja || "";
+        item.ja = normalizeText(ja || "");
         item.jaEl.textContent = item.ja || "…";
         pairsDiv.scrollTop = pairsDiv.scrollHeight;
         rebuildTranslationFromPairs();
@@ -432,6 +511,141 @@
         catchupDiv.appendChild(ul);
       }
 
+      function renderMeetingAssist(msg) {
+        if (!meetingAssistDiv) return;
+        meetingAssistDiv.textContent = "";
+
+        const meta = document.createElement("div");
+        meta.className = "assist-meta";
+        meta.textContent = `対象: 直近 ${formatDuration(msg.window_seconds || 0)}`;
+        meetingAssistDiv.appendChild(meta);
+
+        const ul = document.createElement("ul");
+
+        function addBullet(text) {
+          const li = document.createElement("li");
+          li.textContent = text;
+          return li;
+        }
+
+        function participantText(p) {
+          if (!p) return "";
+          if (typeof p === "string") return p.trim();
+          const name = (p.name || "").trim();
+          const role = (p.role || "").trim();
+          const notes = (p.notes || "").trim();
+          let text = "";
+          if (name && role) text = `${name}（${role}）`;
+          else text = name || role;
+          if (notes) text = text ? `${text} - ${notes}` : notes;
+          return text;
+        }
+
+        const topic = (msg.topic || "").trim();
+        ul.appendChild(addBullet(`今の話題: ${topic || "（不明）"}`));
+
+        const participants = Array.isArray(msg.participants) ? msg.participants : [];
+        if (participants.length) {
+          const li = document.createElement("li");
+          li.appendChild(document.createTextNode("会話者:"));
+          const sub = document.createElement("ul");
+          let added = 0;
+          for (const p of participants) {
+            const text = participantText(p);
+            if (!text) continue;
+            const subLi = document.createElement("li");
+            subLi.textContent = text;
+            sub.appendChild(subLi);
+            added += 1;
+          }
+          if (!added) {
+            li.appendChild(document.createTextNode(" （不明）"));
+          } else {
+            li.appendChild(sub);
+          }
+          ul.appendChild(li);
+        } else {
+          ul.appendChild(addBullet("会話者: （不明）"));
+        }
+
+        const direction = (msg.direction || "").trim();
+        ul.appendChild(addBullet(`会議の方向性: ${direction || "（不明）"}`));
+
+        const options = Array.isArray(msg.options) ? msg.options : [];
+        if (options.length) {
+          const li = document.createElement("li");
+          li.appendChild(document.createTextNode("選択肢:"));
+          const sub = document.createElement("ul");
+          let added = 0;
+          for (const o of options) {
+            let text = "";
+            if (typeof o === "string") text = o.trim();
+            else if (o && typeof o === "object") text = (o.text || "").trim();
+            if (!text) continue;
+            const subLi = document.createElement("li");
+            subLi.textContent = text;
+            sub.appendChild(subLi);
+            added += 1;
+          }
+          if (!added) {
+            li.appendChild(document.createTextNode(" （なし）"));
+          } else {
+            li.appendChild(sub);
+          }
+          ul.appendChild(li);
+        } else {
+          ul.appendChild(addBullet("選択肢: （なし）"));
+        }
+
+        const advice = Array.isArray(msg.english_advice) ? msg.english_advice : [];
+        if (advice.length) {
+          const li = document.createElement("li");
+          li.appendChild(document.createTextNode("英語での発言アドバイス:"));
+          const sub = document.createElement("ul");
+          let added = 0;
+          for (const a of advice) {
+            let ja = "";
+            let en = "";
+            if (typeof a === "string") {
+              ja = a.trim();
+            } else if (a && typeof a === "object") {
+              ja = (a.ja || "").trim();
+              en = (a.en || "").trim();
+            }
+            if (!ja && !en) continue;
+            const subLi = document.createElement("li");
+            subLi.appendChild(document.createTextNode(ja || "（提案）"));
+            if (en) {
+              const phrase = document.createElement("div");
+              phrase.className = "assist-phrase";
+              phrase.textContent = en;
+              subLi.appendChild(phrase);
+            }
+            sub.appendChild(subLi);
+            added += 1;
+          }
+          if (!added) {
+            li.appendChild(document.createTextNode(" （なし）"));
+          } else {
+            li.appendChild(sub);
+          }
+          ul.appendChild(li);
+        } else {
+          ul.appendChild(addBullet("英語での発言アドバイス: （なし）"));
+        }
+
+        meetingAssistDiv.appendChild(ul);
+      }
+
+      function appendMeetingAssistError() {
+        if (!meetingAssistDiv) return;
+        const line = document.createElement("div");
+        line.className = "assist-meta";
+        line.textContent = "Meeting Assist Error: 混雑しています。少し待ってください";
+        meetingAssistDiv.appendChild(line);
+        meetingAssistDiv.scrollTop = meetingAssistDiv.scrollHeight;
+      }
+
       function requestCatchup(seconds) {
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
         try {
@@ -440,20 +654,30 @@
         } catch {}
       }
 
+      function sendMeetingAssistToggle(enabled) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        try {
+          ws.send(JSON.stringify({ type: "meeting_assist_toggle", enabled }));
+        } catch {}
+      }
+
 	  function appendFinal(text) {
-	    if (finalText && !finalText.endsWith("\\n")) finalText += " ";
-	    finalText += text.trim();
+        const normalized = normalizeText(text).trim();
+        if (!normalized) return;
+        if (finalText) finalText += "\\n";
+	    finalText += normalized;
 	    partialText = "";
     updateView();
   }
 
   function setPartial(text) {
-    partialText = text ? (text.trim() + " ") : "";
+    const normalized = normalizeText(text || "").trim();
+    partialText = normalized ? normalized : "";
     updateView();
   }
 
   function appendTranslation(text) {
-    finalTranslation += text;
+    finalTranslation += normalizeText(text || "");
     partialTranslation = "";
     updateTranslationView();
   }
@@ -641,10 +865,18 @@
 		      if (ws !== wsLocal) return;
 		      setStatus("Connected. Capturing audio…");
 		      updateIndicator("ws", "active", "Connected");
-		      updateIndicator("audio", "", "Starting...");
-		      updateIndicator("aws", "", "Connecting...");
+	      updateIndicator("audio", "", "Starting...");
+	      updateIndicator("aws", "", "Connecting...");
 	          updateIndicator("translation", "", "Idle");
 	          updateIndicator("catchup", "", "Idle");
+              updateIndicator(
+                "meeting_assist",
+                meetingAssistToggle && meetingAssistToggle.checked ? "active" : "",
+                meetingAssistToggle && meetingAssistToggle.checked ? "On" : "Off"
+              );
+              if (meetingAssistToggle) {
+                sendMeetingAssistToggle(!!meetingAssistToggle.checked);
+              }
 
       // Wake Lock
       try {
@@ -671,21 +903,23 @@
 		      if (ws !== wsLocal) return;
 		      setStatus("Disconnected.");
 		      updateIndicator("ws", "", "Disconnected");
-		      updateIndicator("audio", "", "Idle");
-		      updateIndicator("aws", "", "Idle");
+	      updateIndicator("audio", "", "Idle");
+	      updateIndicator("aws", "", "Idle");
 	          updateIndicator("translation", "", "Idle");
 	          updateIndicator("catchup", "", "Idle");
-		      if (pingInterval) clearInterval(pingInterval);
-		    };
+              updateIndicator("meeting_assist", "", "Off");
+	      if (pingInterval) clearInterval(pingInterval);
+	    };
 	
 		    wsLocal.onerror = () => {
 		      if (ws !== wsLocal) return;
-		      setStatus("WebSocket error.");
-		      updateIndicator("ws", "error", "Error");
+	      setStatus("WebSocket error.");
+	      updateIndicator("ws", "error", "Error");
 	          updateIndicator("translation", "", "Idle");
 	          updateIndicator("catchup", "", "Idle");
-		      if (pingInterval) clearInterval(pingInterval);
-		    };
+              updateIndicator("meeting_assist", "", "Off");
+	      if (pingInterval) clearInterval(pingInterval);
+	    };
 	
 		    wsLocal.onmessage = (event) => {
 		      if (ws !== wsLocal) return;
@@ -704,9 +938,15 @@
 	            } else if (msg.type === "catchup_result") {
 	              renderCatchup(msg);
                   updateIndicator("catchup", "active", "Ready");
-	            } else if (msg.type === "catchup_error") {
-	              catchupDiv.textContent = "Catch up Error: " + (msg.error || "Unknown");
+	            } else if (msg.type === "meeting_assist_result") {
+	              renderMeetingAssist(msg);
+                  updateIndicator("meeting_assist", "active", "Ready");
+		            } else if (msg.type === "catchup_error") {
+		              catchupDiv.textContent = "Catch up Error: " + (msg.error || "Unknown");
                   updateIndicator("catchup", "error", "Error");
+		        } else if (msg.type === "meeting_assist_error") {
+		          appendMeetingAssistError();
+                  updateIndicator("meeting_assist", "error", "Error");
 		        } else if (msg.type === "translation_error") {
 		          setStatus("Translation Error: " + (msg.error || "Unknown"));
                   updateIndicator("translation", "error", "Error");
@@ -740,6 +980,18 @@
                 updateIndicator("catchup", "error", "Error");
               } else if (msg.status === "catchup_idle") {
                 updateIndicator("catchup", "", "Idle");
+              } else if (msg.status === "meeting_assist_enabled") {
+                updateIndicator("meeting_assist", "active", "On");
+              } else if (msg.status === "meeting_assist_idle") {
+                updateIndicator("meeting_assist", "", "Off");
+              } else if (msg.status === "meeting_assist_generating") {
+                updateIndicator("meeting_assist", "active", "Generating");
+              } else if (msg.status === "meeting_assist_ready") {
+                updateIndicator("meeting_assist", "active", "Ready");
+              } else if (msg.status === "meeting_assist_throttled") {
+                updateIndicator("meeting_assist", "active", "Throttled");
+              } else if (msg.status === "meeting_assist_error") {
+                updateIndicator("meeting_assist", "error", "Error");
 		          }
 		        } else if (msg.type === "ping") {
 		          wsLocal.send(JSON.stringify({type: "pong"}));
@@ -866,7 +1118,7 @@
     URL.revokeObjectURL(url);
   }
 
-	  function clearAll() {
+  function clearAll() {
 	    finalText = "";
 	    partialText = "";
 	    updateView();
@@ -876,6 +1128,11 @@
         alignedPairs.clear();
         if (pairsDiv) pairsDiv.textContent = "…";
         if (catchupDiv) catchupDiv.textContent = "Press a button (30s / 2m / 5m) to catch up.";
+        if (meetingAssistDiv) {
+          meetingAssistDiv.textContent = (meetingAssistToggle && meetingAssistToggle.checked)
+            ? "Meeting Assist is on. Waiting for more conversation..."
+            : "Turn on the switch to get live meeting guidance.";
+        }
 	    if (ws && ws.readyState === WebSocket.OPEN) {
 	      try { ws.send(JSON.stringify({type: "clear"})); } catch {}
 	    }
@@ -892,6 +1149,18 @@
 	      catchup30Btn.onclick = () => requestCatchup(30);
 	      catchup120Btn.onclick = () => requestCatchup(120);
       catchup300Btn.onclick = () => requestCatchup(300);
+      if (meetingAssistToggle) {
+        meetingAssistToggle.onchange = () => {
+          const enabled = !!meetingAssistToggle.checked;
+          updateIndicator("meeting_assist", enabled ? "active" : "", enabled ? "On" : "Off");
+          if (meetingAssistDiv) {
+            meetingAssistDiv.textContent = enabled
+              ? "Meeting Assist を起動しました。会話の流れに応じて更新します。"
+              : "Turn on the switch to get live meeting guidance.";
+          }
+          sendMeetingAssistToggle(enabled);
+        };
+      }
 })();
 </script>
 </body>
