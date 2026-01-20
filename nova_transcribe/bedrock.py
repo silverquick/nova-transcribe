@@ -19,6 +19,8 @@ from smithy_core.interceptors import Interceptor
 from smithy_core.interfaces import TypedProperties
 from smithy_http import Field
 
+from nova_transcribe import settings
+
 
 logger = logging.getLogger("main")
 
@@ -174,6 +176,17 @@ class NovaSonicSession:
         )
 
         # USER audio container
+        audio_input_config = {
+            "mediaType": "audio/lpcm",
+            "sampleRateHertz": 16000,
+            "sampleSizeBits": 16,
+            "channelCount": 1,
+            "audioType": "SPEECH",
+            "encoding": "base64",
+        }
+        if settings.TRANSCRIPT_LANGUAGE:
+            audio_input_config["language"] = settings.TRANSCRIPT_LANGUAGE
+
         await self._send_event(
             json.dumps(
                 {
@@ -184,14 +197,7 @@ class NovaSonicSession:
                             "type": "AUDIO",
                             "interactive": True,
                             "role": "USER",
-                            "audioInputConfiguration": {
-                                "mediaType": "audio/lpcm",
-                                "sampleRateHertz": 16000,
-                                "sampleSizeBits": 16,
-                                "channelCount": 1,
-                                "audioType": "SPEECH",
-                                "encoding": "base64",
-                            },
+                            "audioInputConfiguration": audio_input_config,
                         }
                     }
                 }

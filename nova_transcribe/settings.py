@@ -3,6 +3,9 @@ import os
 
 MODEL_ID = "amazon.nova-2-sonic-v1:0"
 
+# 音声認識の言語設定 (例: "en-US", "ja-JP", None=自動検出)
+TRANSCRIPT_LANGUAGE = os.getenv("TRANSCRIPT_LANGUAGE", None)
+
 TRANSLATION_MODEL_ID_DEFAULT = "anthropic.claude-haiku-4-5-20251001-v1:0"
 TRANSLATION_MODEL_ID = os.getenv("TRANSLATION_MODEL_ID", TRANSLATION_MODEL_ID_DEFAULT)
 TRANSLATION_MODEL_ID_FALLBACK_DEFAULT = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
