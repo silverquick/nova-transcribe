@@ -2,6 +2,9 @@ import os
 
 
 MODEL_ID = "amazon.nova-2-sonic-v1:0"
+NOVA_MAX_TOKENS = int(os.getenv("NOVA_MAX_TOKENS", "1024"))
+NOVA_TOP_P = float(os.getenv("NOVA_TOP_P", "0.9"))
+NOVA_TEMPERATURE = float(os.getenv("NOVA_TEMPERATURE", "0.0"))
 
 # 音声認識の言語設定 (例: "en-US", "ja-JP", None=自動検出)
 TRANSCRIPT_LANGUAGE = os.getenv("TRANSCRIPT_LANGUAGE", None)
