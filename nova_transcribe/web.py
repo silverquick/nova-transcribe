@@ -1142,7 +1142,11 @@ async def ws_endpoint(websocket: WebSocket):
                 if session:
                     await session.close()
                 await start_session()
-            await websocket.send_text(json.dumps({"type": "info", "text": "Session renewed to avoid the 8-minute limit."}))
+            if not await safe_send(
+                {"type": "info", "text": "Session renewed to avoid the 8-minute limit."}
+            ):
+                stop_event.set()
+                return
 
     async def keepalive_loop():
         """プロキシタイムアウト回避用のキープアライブ"""
@@ -1154,12 +1158,11 @@ async def ws_endpoint(websocket: WebSocket):
                 pass
             if stop_event.is_set():
                 return
-            try:
-                await websocket.send_text(json.dumps({"type": "ping"}))
-                logger.debug(f"Sent keepalive ping (audio frames: {audio_frame_count})")
-            except Exception as e:
-                logger.warning(f"Keepalive ping failed: {e}")
-                break
+            if not await safe_send({"type": "ping"}):
+                logger.warning("Keepalive ping failed: WebSocket send failed")
+                stop_event.set()
+                return
+            logger.debug(f"Sent keepalive ping (audio frames: {audio_frame_count})")
 
     async def recv_from_browser():
         nonlocal audio_frame_count, last_audio_time, translation_started, translation_segment_seq, conversation_epoch
@@ -1184,19 +1187,26 @@ async def ws_endpoint(websocket: WebSocket):
                             meeting_assist_last_seq_scheduled = 0
                             utterance_log.clear()
                             utterance_by_id.clear()
-                            try:
-                                await websocket.send_text(json.dumps({"type": "status", "status": "translation_idle"}))
-                                await websocket.send_text(json.dumps({"type": "status", "status": "catchup_idle"}))
-                                if meeting_assist_enabled:
-                                    await websocket.send_text(
-                                        json.dumps({"type": "status", "status": "meeting_assist_enabled"})
-                                    )
-                                else:
-                                    await websocket.send_text(
-                                        json.dumps({"type": "status", "status": "meeting_assist_idle"})
-                                    )
-                            except Exception:
-                                break
+                            if not await safe_send(
+                                {"type": "status", "status": "translation_idle"}
+                            ):
+                                stop_event.set()
+                                return
+                            if not await safe_send({"type": "status", "status": "catchup_idle"}):
+                                stop_event.set()
+                                return
+                            if meeting_assist_enabled:
+                                if not await safe_send(
+                                    {"type": "status", "status": "meeting_assist_enabled"}
+                                ):
+                                    stop_event.set()
+                                    return
+                            else:
+                                if not await safe_send(
+                                    {"type": "status", "status": "meeting_assist_idle"}
+                                ):
+                                    stop_event.set()
+                                    return
                             try:
                                 while True:
                                     translation_q.get_nowait()
@@ -1254,7 +1264,9 @@ async def ws_endpoint(websocket: WebSocket):
                         current_time = time.time()
                         if current_time - last_audio_time >= 5.0:
                             logger.info(f"Audio receiving: {audio_frame_count} frames received")
-                            await websocket.send_text(json.dumps({"type": "status", "status": "audio_receiving"}))
+                            if not await safe_send({"type": "status", "status": "audio_receiving"}):
+                                stop_event.set()
+                                return
                             last_audio_time = current_time
                     except asyncio.QueueFull:
                         # キューが満杯の場合、古いフレームを破棄して新しいフレームを追加（リアルタイム性優先）
@@ -1304,7 +1316,11 @@ async def ws_endpoint(websocket: WebSocket):
                         logger.info(f"Sent {frame_count_local} audio frames to Bedrock ({total_bytes} bytes)")
                 except Exception as e:
                     logger.error(f"Error sending audio to Bedrock: {e}", exc_info=True)
-                    await websocket.send_text(json.dumps({"type": "status", "status": "aws_error", "error": str(e)}))
+                    if not await safe_send(
+                        {"type": "status", "status": "aws_error", "error": str(e)}
+                    ):
+                        stop_event.set()
+                        return
 
     async with session_lock:
         await start_session()
