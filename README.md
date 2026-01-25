@@ -110,6 +110,11 @@ AWS_REGION=ap-northeast-1
 # 英語のみに限定する場合:
 # TRANSCRIPT_LANGUAGE=en-US
 
+# Nova 2 Sonic の推論設定（運用時に調整可能・任意）
+# NOVA_MAX_TOKENS=1024
+# NOVA_TOP_P=0.9
+# NOVA_TEMPERATURE=0.0
+
 # 翻訳設定（オプション）
 # 注意: Claude 4.5 Haiku はリージョンによって on-demand throughput が使えず、
 # inference profile の ID/ARN 指定が必要な場合があります
@@ -160,6 +165,9 @@ AWS_REGION=ap-northeast-1
 | AWS | `AWS_REGION` | 任意 | `ap-northeast-1` | Bedrock Runtime のリージョン |
 | App | `LOG_LEVEL` | 任意 | `INFO` | ログレベル（例: `DEBUG`） |
 | 音声認識 | `TRANSCRIPT_LANGUAGE` | 任意 | なし（自動検出） | 認識言語（例: `en-US`, `ja-JP`）。英語のみに限定する場合は `en-US` を指定 |
+| 音声認識 | `NOVA_MAX_TOKENS` | 任意 | `1024` | Nova 2 Sonic の最大出力トークン（運用時に調整可） |
+| 音声認識 | `NOVA_TOP_P` | 任意 | `0.9` | Nova 2 Sonic の top-p（運用時に調整可） |
+| 音声認識 | `NOVA_TEMPERATURE` | 任意 | `0.0` | Nova 2 Sonic の temperature（運用時に調整可） |
 | 翻訳 | `TRANSLATION_MODEL_ID` | 任意 | `anthropic.claude-haiku-4-5-20251001-v1:0` | 翻訳モデルID（環境によって inference profile 推奨） |
 | 翻訳 | `TRANSLATION_MODEL_ID_FALLBACK` | 任意 | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | on-demand 不可時のフォールバック |
 | 翻訳 | `TRANSLATION_MAX_TOKENS` | 任意 | `400` | 翻訳の最大出力トークン |

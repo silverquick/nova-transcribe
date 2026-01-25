@@ -95,9 +95,9 @@ class NovaSonicSession:
                     "event": {
                         "sessionStart": {
                             "inferenceConfiguration": {
-                                "maxTokens": 1024,
-                                "topP": 0.9,
-                                "temperature": 0.0,
+                                "maxTokens": settings.NOVA_MAX_TOKENS,
+                                "topP": settings.NOVA_TOP_P,
+                                "temperature": settings.NOVA_TEMPERATURE,
                             },
                             "turnDetectionConfiguration": {
                                 "endpointingSensitivity": "HIGH"
@@ -346,4 +346,3 @@ async def stream_prompt_text_deltas(
             if not delta_text:
                 continue
             yield delta_text
-
