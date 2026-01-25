@@ -182,6 +182,33 @@ async def ws_endpoint(websocket: WebSocket):
         logger.info("translation_worker task started, waiting for translation requests...")
         last_request_at = 0.0
         backoff_seconds = 0.0
+        max_backoff_seconds = 8.0
+        error_idle_delay_seconds = 2.0
+
+        def _increase_backoff(reason: str) -> float:
+            nonlocal backoff_seconds
+            backoff_seconds = min(backoff_seconds * 2 if backoff_seconds else 0.5, max_backoff_seconds)
+            if backoff_seconds >= max_backoff_seconds:
+                logger.info(
+                    "Translation backoff capped at %.1fs (%s). Worker remains active and will retry.",
+                    backoff_seconds,
+                    reason,
+                )
+            return backoff_seconds
+
+        async def _notify_error_and_idle(message: str, batch_epoch: int) -> None:
+            await safe_send({"type": "status", "status": "translation_error"})
+            if message:
+                await safe_send({"type": "translation_error", "error": message})
+            await asyncio.sleep(error_idle_delay_seconds)
+            if (
+                stop_event.is_set()
+                or not translation_enabled
+                or batch_epoch != conversation_epoch
+            ):
+                return
+            await safe_send({"type": "status", "status": "translation_idle"})
+
         while not stop_event.is_set():
             try:
                 first_item = await translation_q.get()
@@ -347,9 +374,10 @@ async def ws_endpoint(websocket: WebSocket):
                         break
 
                     logger.error(f"Translation error: {e}", exc_info=True)
-                    await safe_send({"type": "status", "status": "translation_error"})
-                    await safe_send({"type": "translation_error", "error": str(e)})
-                    break
+                    backoff_seconds = _increase_backoff("resource_not_found")
+                    await _notify_error_and_idle(str(e), batch_epoch)
+                    await asyncio.sleep(max(backoff_seconds - error_idle_delay_seconds, 0.0))
+                    continue
 
                 except ValidationException as e:
                     message = (getattr(e, "message", None) or str(e) or "").lower()
@@ -380,13 +408,14 @@ async def ws_endpoint(websocket: WebSocket):
                         continue
 
                     logger.error(f"Translation error: {e}", exc_info=True)
-                    await safe_send({"type": "status", "status": "translation_error"})
-                    await safe_send({"type": "translation_error", "error": str(e)})
-                    break
+                    backoff_seconds = _increase_backoff("validation_error")
+                    await _notify_error_and_idle(str(e), batch_epoch)
+                    await asyncio.sleep(max(backoff_seconds - error_idle_delay_seconds, 0.0))
+                    continue
 
                 except ThrottlingException as e:
                     # 翻訳が追いつかないときは待って再試行し、キューが溜まっていればまとめて翻訳する
-                    backoff_seconds = min(backoff_seconds * 2 if backoff_seconds else 0.5, 8.0)
+                    backoff_seconds = _increase_backoff("throttling")
                     logger.warning(
                         f"Translation throttled. Backing off {backoff_seconds:.1f}s: {e}"
                     )
@@ -421,9 +450,10 @@ async def ws_endpoint(websocket: WebSocket):
 
                 except Exception as e:
                     logger.error(f"Translation error: {e}", exc_info=True)
-                    await safe_send({"type": "status", "status": "translation_error"})
-                    await safe_send({"type": "translation_error", "error": str(e)})
-                    break
+                    backoff_seconds = _increase_backoff("unexpected_error")
+                    await _notify_error_and_idle(str(e), batch_epoch)
+                    await asyncio.sleep(max(backoff_seconds - error_idle_delay_seconds, 0.0))
+                    continue
 
         logger.info(
             "translation_worker task ended. "
