@@ -76,6 +76,7 @@ async def ws_endpoint(websocket: WebSocket):
 
     session_lock = asyncio.Lock()
     stop_event = asyncio.Event()
+    session_refreshing = asyncio.Event()
 
     session: Optional[NovaSonicSession] = None
     output_task: Optional[asyncio.Task] = None
@@ -1139,9 +1140,13 @@ async def ws_endpoint(websocket: WebSocket):
                 return
             logger.info("Renewing Bedrock session (8-minute limit prevention)...")
             async with session_lock:
-                if session:
-                    await session.close()
-                await start_session()
+                session_refreshing.set()
+                try:
+                    if session:
+                        await session.close()
+                    await start_session()
+                finally:
+                    session_refreshing.clear()
             await websocket.send_text(json.dumps({"type": "info", "text": "Session renewed to avoid the 8-minute limit."}))
 
     async def keepalive_loop():
@@ -1285,6 +1290,67 @@ async def ws_endpoint(websocket: WebSocket):
         nonlocal audio_frame_count
         frame_count_local = 0
         total_bytes = 0
+        pending_audio: deque[tuple[float, bytes]] = deque()
+        buffering_active = False
+        buffered_frames_total = 0
+        dropped_frames_total = 0
+        dropped_bytes_total = 0
+        last_buffer_log = 0.0
+        last_drop_log = 0.0
+        pending_max_frames = 50
+        pending_max_seconds = 2.0
+
+        def _buffer_frame(frame_data: bytes, now_mono: float, reason: str) -> None:
+            nonlocal buffering_active, buffered_frames_total, dropped_frames_total, dropped_bytes_total, last_buffer_log
+            pending_audio.append((now_mono, frame_data))
+            buffered_frames_total += 1
+            if not buffering_active:
+                buffering_active = True
+                logger.warning(
+                    "Audio buffering started (reason=%s, pending=%s frames)",
+                    reason,
+                    len(pending_audio),
+                )
+            if len(pending_audio) > pending_max_frames:
+                ts, dropped = pending_audio.popleft()
+                dropped_frames_total += 1
+                dropped_bytes_total += len(dropped)
+                now = time.monotonic()
+                if now - last_drop_log > 1.0:
+                    last_drop_log = now
+                    age = now - ts
+                    logger.warning(
+                        "Audio buffer overflow. Dropped oldest frame (age=%.2fs, total_dropped=%s frames, %s bytes)",
+                        age,
+                        dropped_frames_total,
+                        dropped_bytes_total,
+                    )
+            now = time.monotonic()
+            if now - last_buffer_log > 2.0:
+                last_buffer_log = now
+                logger.info(
+                    "Buffering audio frames (pending=%s, buffered_total=%s, dropped_total=%s)",
+                    len(pending_audio),
+                    buffered_frames_total,
+                    dropped_frames_total,
+                )
+
+        def _drop_stale(now_mono: float) -> None:
+            nonlocal dropped_frames_total, dropped_bytes_total, last_drop_log
+            while pending_audio and (now_mono - pending_audio[0][0]) > pending_max_seconds:
+                ts, dropped = pending_audio.popleft()
+                dropped_frames_total += 1
+                dropped_bytes_total += len(dropped)
+                if now_mono - last_drop_log > 1.0:
+                    last_drop_log = now_mono
+                    age = now_mono - ts
+                    logger.warning(
+                        "Dropped stale buffered frame (age=%.2fs, total_dropped=%s frames, %s bytes)",
+                        age,
+                        dropped_frames_total,
+                        dropped_bytes_total,
+                    )
+
         while not stop_event.is_set():
             frame = await audio_q.get()
             if frame is None:
@@ -1293,18 +1359,58 @@ async def ws_endpoint(websocket: WebSocket):
             # ロックフリーでセッション参照を取得（レイテンシ削減）
             # セッション差し替え時のみ session_lock を使用（renew_loop 内）
             current_session = session
-            if current_session and current_session.is_active:
+            now_mono = time.monotonic()
+            if not current_session or not current_session.is_active:
+                reason = "session_refreshing" if session_refreshing.is_set() else "session_inactive"
+                _buffer_frame(frame, now_mono, reason=reason)
+                continue
+
+            _drop_stale(now_mono)
+
+            if buffering_active and pending_audio:
+                logger.info(
+                    "Audio buffering ended. Flushing %s pending frames (buffered_total=%s, dropped_total=%s)",
+                    len(pending_audio),
+                    buffered_frames_total,
+                    dropped_frames_total,
+                )
+
+            while pending_audio and current_session and current_session.is_active:
+                ts, buffered = pending_audio.popleft()
+                if (now_mono - ts) > pending_max_seconds:
+                    dropped_frames_total += 1
+                    dropped_bytes_total += len(buffered)
+                    continue
                 try:
-                    await current_session.send_audio(frame)
+                    await current_session.send_audio(buffered)
                     frame_count_local += 1
-                    total_bytes += len(frame)
-                    if frame_count_local == 1:
-                        logger.info(f"First audio frame sent to Bedrock: {len(frame)} bytes")
-                    elif frame_count_local % 100 == 0:
-                        logger.info(f"Sent {frame_count_local} audio frames to Bedrock ({total_bytes} bytes)")
+                    total_bytes += len(buffered)
                 except Exception as e:
-                    logger.error(f"Error sending audio to Bedrock: {e}", exc_info=True)
-                    await websocket.send_text(json.dumps({"type": "status", "status": "aws_error", "error": str(e)}))
+                    logger.error(f"Error sending buffered audio to Bedrock: {e}", exc_info=True)
+                    await websocket.send_text(
+                        json.dumps({"type": "status", "status": "aws_error", "error": str(e)})
+                    )
+                    _buffer_frame(buffered, time.monotonic(), reason="send_error")
+                    break
+
+            if not current_session or not current_session.is_active:
+                _buffer_frame(frame, time.monotonic(), reason="session_inactive")
+                continue
+
+            buffering_active = False
+
+            try:
+                await current_session.send_audio(frame)
+                frame_count_local += 1
+                total_bytes += len(frame)
+                if frame_count_local == 1:
+                    logger.info(f"First audio frame sent to Bedrock: {len(frame)} bytes")
+                elif frame_count_local % 100 == 0:
+                    logger.info(f"Sent {frame_count_local} audio frames to Bedrock ({total_bytes} bytes)")
+            except Exception as e:
+                logger.error(f"Error sending audio to Bedrock: {e}", exc_info=True)
+                await websocket.send_text(json.dumps({"type": "status", "status": "aws_error", "error": str(e)}))
+                _buffer_frame(frame, time.monotonic(), reason="send_error")
 
     async with session_lock:
         await start_session()
