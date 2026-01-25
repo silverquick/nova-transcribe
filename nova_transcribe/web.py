@@ -563,7 +563,21 @@ async def ws_endpoint(websocket: WebSocket):
                     continue
 
                 json_part = _extract_first_json_object(buf)
-                parsed = json.loads(json_part) if json_part else None
+                if not json_part:
+                    logger.error(
+                        "Catch up JSON extraction failed: no complete JSON object found. "
+                        f"output_len={len(buf)}, output_preview={buf[:200]!r}"
+                    )
+                    raise ValueError("No complete JSON object found in catch-up output")
+                try:
+                    parsed = json.loads(json_part)
+                except json.JSONDecodeError as e:
+                    logger.error(
+                        "Catch up JSON decode failed: %s. json_preview=%r",
+                        e,
+                        json_part[:200],
+                    )
+                    raise
                 if not isinstance(parsed, dict):
                     raise ValueError("Invalid JSON from model")
 
@@ -788,6 +802,10 @@ async def ws_endpoint(websocket: WebSocket):
 
                 parsed = _parse_json_maybe(buf)
                 if not isinstance(parsed, dict):
+                    logger.warning(
+                        "Meeting assist JSON parse failed; attempting repair. "
+                        f"output_len={len(buf)}, output_preview={buf[:200]!r}"
+                    )
                     # 1回だけ再試行：モデル出力を修復させる
                     fix_prompt = (
                         "You will be given a response that should be JSON but is invalid.\n"
@@ -819,6 +837,11 @@ async def ws_endpoint(websocket: WebSocket):
                     parsed = _parse_json_maybe(buf_retry)
 
                 if not isinstance(parsed, dict):
+                    logger.error(
+                        "Meeting assist JSON parse failed after repair attempt. "
+                        f"output_len={len(buf)}, retry_len={len(buf_retry)}, "
+                        f"retry_preview={buf_retry[:200]!r}"
+                    )
                     raise ValueError("Invalid JSON from model")
 
                 topic = str(parsed.get("topic") or "").strip()

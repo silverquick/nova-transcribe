@@ -59,8 +59,44 @@ def _extract_first_json_object(text: str) -> Optional[str]:
     """
     if not text:
         return None
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    return text[start : end + 1]
+    decoder = json.JSONDecoder()
+    in_string = False
+    escape = False
+    depth = 0
+    start = None
+
+    for idx, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+
+        if ch == "{":
+            if depth == 0:
+                start = idx
+                try:
+                    obj, end = decoder.raw_decode(text[start:])
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    if isinstance(obj, dict):
+                        return text[start : start + end]
+            depth += 1
+            continue
+
+        if ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                return text[start : idx + 1]
+
+    return None
